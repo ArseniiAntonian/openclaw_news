@@ -1,0 +1,46 @@
+# Secrets and local agent state
+.openclaw/
+**/.openclaw/
+memory/
+**/memory/
+MEMORY.md
+openclaw-workspace-state.json
+**/MEMORY.md
+**/openclaw-workspace-state.json
+**/.env
+**/.git/
+
+# Python environments and caches
+.venv/
+**/.venv/
+.venv
+**/.venv
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+*.pyc
+*.pyo
+.coverage
+
+# Logs and runtime artifacts
+logs/
+**/logs/
+*.log
+*.pid
+*.out
+*.err
+
+# Generated exports and large local data
+out/
+**/out/
+*.csv
+*.csv.gz
+*.tsv
+*.jsonl
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
