@@ -1,6 +1,8 @@
 # Secrets and local agent state
 .openclaw/
 **/.openclaw/
+.claude/
+**/.claude/
 memory/
 **/memory/
 MEMORY.md
