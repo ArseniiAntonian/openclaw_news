@@ -1,5 +1,15 @@
 # agent_1 Pipeline v1
 
+> **Superseded (2026-07-20).** This describes the v1 pipeline, where
+> `agent_1` did KR labeling and semantic enrichment (stages 4-8 below).
+> That's no longer current: `agent_1`'s scope narrowed to collect → clean →
+> dedup → embeddings (rework-agent-1-v5), and stages 4-8 move to future
+> Agents 2/4. Current behavior lives in `openspec/specs/agent_1*` (as-is
+> snapshot) and `openspec/changes/rework-agent-1-v5/` (target state);
+> architecture context in `docs/architecture/`. This file stays as a
+> reference for the label_kr_worker.py / extract_semantics_worker.py code,
+> which remains in the repo but is no longer wired into `agent_1`'s queue.
+
 ## Purpose
 
 `agent_1` is not the whole pipeline.

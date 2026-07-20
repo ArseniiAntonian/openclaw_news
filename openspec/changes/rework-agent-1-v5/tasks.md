@@ -43,17 +43,31 @@
 
 ## 2. Вывод LLM-этапов из Агента 1 (BREAKING)
 
-- [ ] 2.1 Исключить постановку `label_kr` job'ов из препроцессинга;
+- [x] 2.1 Исключить постановку `label_kr` job'ов из препроцессинга;
       `label_kr_worker.py`, `extract_semantics_worker.py`,
       `kr_enrichment_sync.py`, `label_prompts.py` — убрать из
       запуска/оркестрации Агента 1 (код остаётся в репо как референс для
-      Агентов 2/4).
+      Агентов 2/4). Удалён вызов `enqueue_label_job()` и сама функция из
+      `preprocess_worker.py` (единственная точка постановки `label_kr` в
+      коде — оркестрации/cron/systemd в репозитории нет вообще, это
+      server-side; сами воркер-файлы не тронуты). Тесты
+      `test_preprocess_worker.py` зелёные (19/19).
 - [ ] 2.2 Пометить `document_kr_labels` / `document_enrichments` /
       чекпоинт-таблицы как read-only наследие (комментарий в БД/доках);
-      подтвердить, что silver-датасет разметки сохранён.
-- [ ] 2.3 Обновить `agents/agent_1/README.md`, `IDENTITY.md` и снести/
+      подтвердить, что silver-датасет разметки сохранён. SQL готов —
+      `agents/agent_1/db/007_mark_kr_labeling_readonly.sql`
+      (`document_kr_labels`, `document_enrichments`,
+      `label_kr_step_checkpoints`, `extract_semantics_step_checkpoints`,
+      `llm_call_logs` — только `COMMENT ON TABLE`, без изменений схемы/
+      данных). Не отмечено done: ждём накатки на `mvp_db` через OpenClaw.
+- [x] 2.3 Обновить `agents/agent_1/README.md`, `IDENTITY.md` и снести/
       пометить устаревшим `PIPELINE_V1.md` (заменён спеками и
-      `docs/architecture/`).
+      `docs/architecture/`). `PIPELINE_V1.md` — баннер "Superseded" сверху,
+      содержимое сохранено как референс под старый код воркеров;
+      `README.md` — секция preprocess worker обновлена (больше не ставит
+      `label_kr`), секция KR labeling worker помечена legacy/disconnected;
+      `IDENTITY.md` — роль переписана под v5 (сбор/очистка/дедуп/
+      эмбеддинги, ноль LLM-вызовов).
 
 ## 3. Перф-переделка препроцессинга
 

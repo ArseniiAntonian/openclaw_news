@@ -1,5 +1,13 @@
 # agent_1 Runtime
 
+> **Note (2026-07-20):** `agent_1`'s scope is narrowing to collect → clean →
+> dedup → embeddings (rework-agent-1-v5); KR labeling and semantic
+> enrichment move to future Agents 2/4. This doc still describes the
+> currently-running v1 workers (`agent_1` schema); the "KR labeling worker"
+> section below is legacy reference — `preprocess_worker` no longer enqueues
+> `label_kr` jobs. See `openspec/specs/agent_1*` and
+> `openspec/changes/rework-agent-1-v5/` for current/target behavior.
+
 ## Parsers360 ingestion
 
 The Parsers360 parser pulls raw news into `agent_1.raw_items` inside `mvp_db`.
@@ -95,8 +103,9 @@ tail -f /root/.openclaw/workspace/agents/agent_1/logs/parsers360.log
 `preprocess_worker` drains `agent_1.processing_jobs` rows with
 `job_type='preprocess'`, cleans the text, performs exact duplicate detection,
 applies a lightweight MinHash-style near-duplicate check for news documents,
-writes surviving documents into `agent_1.clean_items`, and enqueues `label_kr`
-jobs for the next stage.
+and writes surviving documents into `agent_1.clean_items`. As of
+rework-agent-1-v5 stage 2 it no longer enqueues `label_kr` jobs — `agent_1`'s
+scope stops at clean/dedup (embeddings are a separate future stage).
 
 The current preprocess stage is Russian-only by design: if the cleaned document
 contains enough alphabetic text to classify and the script balance is not
@@ -135,7 +144,14 @@ Follow the worker log:
 tail -f /root/.openclaw/workspace/agents/agent_1/logs/preprocess_worker.log
 ```
 
-## KR labeling worker
+## KR labeling worker (legacy, disconnected from the queue)
+
+> No longer part of `agent_1`'s active pipeline: `preprocess_worker` stopped
+> enqueueing `label_kr` jobs (rework-agent-1-v5 stage 2). The worker code and
+> instructions below still work standalone (e.g. for manual runs or as
+> reference while building Agent 4), but nothing feeds it automatically
+> anymore. `document_kr_labels` and related tables are read-only history —
+> see `agents/agent_1/db/007_mark_kr_labeling_readonly.sql`.
 
 `label_kr_worker` drains `agent_1.processing_jobs` rows with
 `job_type='label_kr'`, loads the matching `clean_items` row and all active

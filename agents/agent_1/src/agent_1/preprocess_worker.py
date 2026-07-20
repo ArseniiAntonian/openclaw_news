@@ -1217,30 +1217,6 @@ def mark_job_status(conn: psycopg.Connection[Any], job_id: int, status: str) -> 
         )
 
 
-def enqueue_label_job(conn: psycopg.Connection[Any], clean_item_id: int) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO agent_1.processing_jobs (
-                job_type,
-                entity_type,
-                entity_id,
-                status
-            )
-            VALUES (
-                'label_kr',
-                'clean_item',
-                %s,
-                'pending'
-            )
-            ON CONFLICT (job_type, entity_type, entity_id)
-            WHERE status IN ('pending', 'processing')
-            DO NOTHING
-            """,
-            (clean_item_id,),
-        )
-
-
 def insert_clean_item(
     conn: psycopg.Connection[Any],
     *,
@@ -1490,7 +1466,9 @@ def process_job(
         clean_text=clean_text,
         language=language,
     )
-    enqueue_label_job(conn, clean_item_id)
+    # rework-agent-1-v5 stage 2: LLM-разметка (label_kr / extract_semantics)
+    # выведена из Агента 1 (см. openspec/changes/rework-agent-1-v5). Раньше
+    # здесь был enqueue_label_job(conn, clean_item_id).
     merge_source_metadata(
         conn,
         raw_item_id,
