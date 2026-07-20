@@ -1,3 +1,10 @@
+> **Статус (2026-07-17):** ретро-фиксация (секция 1 tasks) выполнена и
+> синкается в main-спеки как снимок «как есть». Спека
+> `agent_1-deterministic-enrichment` **отменена** — не реализована и в
+> архитектуре v5 не существует (см. `docs/architecture/pipeline_v5_context.md`);
+> в main-спеки не переносится. Дальнейшая эволюция Агента 1 — в change
+> `rework-agent-1-v5`.
+
 ## Why
 
 Пайплайн `agent_1` (Parsers360 ingestion → preprocessing/dedup → KR labeling →

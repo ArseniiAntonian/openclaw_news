@@ -1,0 +1,221 @@
+digraph schema_v5 {
+    rankdir=LR;
+    splines=spline;
+    nodesep=0.5;
+    ranksep=1.0;
+    fontname="Helvetica";
+    node [shape=plain, fontname="Helvetica", fontsize=11];
+    edge [color="#5c6bc0", arrowsize=0.7, penwidth=1.1, fontname="Helvetica", fontsize=10];
+
+    // ============ ВХОДЫ ============
+    source [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#e8eaf6"><B>source</B></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_source</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">name_source</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">URL_source</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">type</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">importance</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">Is_active</TD><TD></TD></TR>
+      </TABLE>>];
+
+    Key_results [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#e8eaf6"><B>Key_results</B>  <FONT POINT-SIZE="9">Агент 2</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_Key_result</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">text_Key_result</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">text_expanded</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">theme</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">keywords</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">embedding vector(1024)</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">created_at</TD><TD></TD></TR>
+      </TABLE>>];
+
+    // ============ АГЕНТ 1: сбор ============
+    raw_posts [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#e3f2fd"><B>raw_posts</B>  <FONT POINT-SIZE="9">Агент 1 · сбор</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_raw_post</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_source</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">parser</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">title</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">url</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">content</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">time_post</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">lang</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">metadata jsonb</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">collected_at</TD><TD></TD></TR>
+      </TABLE>>];
+
+    // ============ АГЕНТ 1: очистка + дедуп + эмбеддинг ============
+    clean_posts [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#e3f2fd"><B>clean_posts</B>  <FONT POINT-SIZE="9">Агент 1 · очистка</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_clean_post</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_raw_post</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_canonical_post</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_cluster</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">clean_content</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">is_duplicate</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">dup_score</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">embedding vector(1024)</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">cleaned_at</TD><TD></TD></TR>
+      </TABLE>>];
+
+    // ============ АГЕНТ 3: кластеры ============
+    cluster_t [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#e0f2f1"><B>cluster</B>  <FONT POINT-SIZE="9">Агент 3</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_cluster</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">label</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">centroid vector(1024)</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">method</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">size</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">period_start</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">period_end</TD><TD></TD></TR>
+      </TABLE>>];
+
+    kr_cluster_match [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#e0f2f1"><B>kr_cluster_match</B>  <FONT POINT-SIZE="9">Агент 3</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_Key_result</TD><TD>PK,FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_cluster</TD><TD>PK,FK</TD></TR>
+        <TR><TD ALIGN="LEFT">match_score</TD><TD></TD></TR>
+      </TABLE>>];
+
+    // ============ АГЕНТ 4: GLiNER ============
+    gliner_entities [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#fff3e0"><B>gliner_entities</B>  <FONT POINT-SIZE="9">Агент 4 · разметка</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_gliner_entity</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_clean_post</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_entity_canonical</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">entity_type</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">span_text</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">char_start</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">char_end</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">score</TD><TD></TD></TR>
+      </TABLE>>];
+
+    entity_canonical [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#fff3e0"><B>entity_canonical</B></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_entity_canonical</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">canonical_name</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">entity_type</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">aliases jsonb</TD><TD></TD></TR>
+      </TABLE>>];
+
+    // ============ АГЕНТ 4: драйверы ============
+    driver_instance [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#fff3e0"><B>driver_instance</B>  <FONT POINT-SIZE="9">Агент 4 · драйверы</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_driver_instance</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_actor</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_object</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">normalized_key</TD><TD>UK</TD></TR>
+        <TR><TD ALIGN="LEFT">driver_type</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">event_type</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">centroid vector(1024)</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">status</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">priority</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">action_text</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">confidence</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">first_seen_at</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">last_seen_at</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">mention_count</TD><TD></TD></TR>
+      </TABLE>>];
+
+    driver_mention [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#fff3e0"><B>driver_mention</B>  <FONT POINT-SIZE="9">Агент 4 · динамика = агрегат</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_driver_mention</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_driver_instance</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_clean_post</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_Key_result</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">extracted_delta</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">direction</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">magnitude</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">horizon</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">confidence</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">created_at</TD><TD></TD></TR>
+      </TABLE>>];
+
+    // ============ АГЕНТ 4+5: отчёт ============
+    kr_report [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#e8f5e9"><B>kr_report</B>  <FONT POINT-SIZE="9">Агент 4+5</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_report</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_Key_result</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">period_start</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">period_end</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">total_relevant_posts</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">active_drivers</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">index_1 / index_2 / index_3</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">status_color</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">root_causes</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">recommendation</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">forecast</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">report_content</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">report_summary</TD><TD></TD></TR>
+      </TABLE>>];
+
+    // ============ АГЕНТ 6: оркестрация ============
+    processing_jobs [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#fce4ec"><B>processing_jobs</B>  <FONT POINT-SIZE="9">Агент 6</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_job</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_Key_result</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">agent</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">job_type</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">job_status</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">priority</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">attempts</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">payload jsonb</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">created_at … completed_at</TD><TD></TD></TR>
+      </TABLE>>];
+
+    post_kr_processing [label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4" BGCOLOR="white">
+        <TR><TD COLSPAN="2" BGCOLOR="#fce4ec"><B>post_kr_processing</B>  <FONT POINT-SIZE="9">хребет: пост × КР</FONT></TD></TR>
+        <TR><TD ALIGN="LEFT">ID_post_kr</TD><TD>PK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_clean_post</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_Key_result</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">ID_job</TD><TD>FK</TD></TR>
+        <TR><TD ALIGN="LEFT">current_stage</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">status</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">drop_reason</TD><TD></TD></TR>
+        <TR><TD ALIGN="LEFT">updated_at</TD><TD></TD></TR>
+      </TABLE>>];
+
+    // ============ каркас колонок ============
+    { rank=same; source; Key_results; }
+    { rank=same; raw_posts; processing_jobs; }
+    { rank=same; clean_posts; post_kr_processing; }
+    { rank=same; cluster_t; kr_cluster_match; }
+    { rank=same; gliner_entities; entity_canonical; }
+    { rank=same; driver_instance; driver_mention; }
+
+    // ============ связи ============
+    source -> raw_posts                 [label="источник"];
+    raw_posts -> clean_posts            [label="очистка"];
+    clean_posts -> clean_posts          [label="дедуп: оригинал", style=dashed];
+    clean_posts -> cluster_t            [label="членство"];
+    Key_results -> kr_cluster_match;
+    cluster_t -> kr_cluster_match       [label="мэтч КР↔кластер"];
+
+    clean_posts -> gliner_entities      [label="GLiNER-спаны"];
+    gliner_entities -> entity_canonical [label="нормализация"];
+    entity_canonical -> driver_instance [label="актор / объект"];
+    cluster_t -> driver_instance        [label="кандидаты", style=dashed];
+    driver_instance -> driver_mention;
+    clean_posts -> driver_mention       [label="упоминание"];
+    Key_results -> driver_mention       [label="affected KR"];
+
+    driver_mention -> kr_report         [label="агрегация", style=dashed];
+    Key_results -> kr_report;
+
+    Key_results -> processing_jobs      [label="субъект", style=dashed];
+    processing_jobs -> post_kr_processing [label="lineage"];
+    clean_posts -> post_kr_processing   [style=dashed];
+}
