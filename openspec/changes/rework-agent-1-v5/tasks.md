@@ -52,14 +52,21 @@
       коде — оркестрации/cron/systemd в репозитории нет вообще, это
       server-side; сами воркер-файлы не тронуты). Тесты
       `test_preprocess_worker.py` зелёные (19/19).
-- [ ] 2.2 Пометить `document_kr_labels` / `document_enrichments` /
+- [x] 2.2 Пометить `document_kr_labels` / `document_enrichments` /
       чекпоинт-таблицы как read-only наследие (комментарий в БД/доках);
-      подтвердить, что silver-датасет разметки сохранён. SQL готов —
-      `agents/agent_1/db/007_mark_kr_labeling_readonly.sql`
-      (`document_kr_labels`, `document_enrichments`,
-      `label_kr_step_checkpoints`, `extract_semantics_step_checkpoints`,
-      `llm_call_logs` — только `COMMENT ON TABLE`, без изменений схемы/
-      данных). Не отмечено done: ждём накатки на `mvp_db` через OpenClaw.
+      подтвердить, что silver-датасет разметки сохранён.
+      `agents/agent_1/db/007_mark_kr_labeling_readonly.sql` накачен на
+      `mvp_db` 2026-07-20 (`COMMENT ON TABLE`, без изменений схемы/данных)
+      — все 5 комментариев подтверждены через
+      `obj_description(..., 'pg_class')` на `document_kr_labels`,
+      `document_enrichments`, `label_kr_step_checkpoints`,
+      `extract_semantics_step_checkpoints`, `llm_call_logs`. Живых
+      процессов `label_kr_worker`/`extract_semantics_worker` на сервере не
+      найдено (не крон, не оркестрация — были только ручные запуски).
+      942 pending `label_kr`-джобы в `agent_1.processing_jobs` — сходится
+      1:1 с числом "kept" из миграции данных (1.4), подтверждает
+      целостность silver-датасета (ничего не потеряно, очередь просто
+      не разгребалась и дальше не разгребётся, что и требуется).
 - [x] 2.3 Обновить `agents/agent_1/README.md`, `IDENTITY.md` и снести/
       пометить устаревшим `PIPELINE_V1.md` (заменён спеками и
       `docs/architecture/`). `PIPELINE_V1.md` — баннер "Superseded" сверху,
