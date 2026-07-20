@@ -6,13 +6,19 @@
 
 ## 1. Схема данных v5 (зона Агента 1)
 
-- [ ] 1.1 DDL: `CREATE EXTENSION vector`; таблицы `source`, `raw_posts`,
+- [x] 1.1 DDL: `CREATE EXTENSION vector`; таблицы `source`, `raw_posts`,
       `clean_posts` по `docs/architecture/schema_v5.dot` — композитные PK с
       `time_post`, LZ4-компрессия `content`/`clean_content`, nullable
       `ID_cluster` (под Агент 3), поле `drop_reason`, уникальный индекс
-      exact-dedup ключа.
-- [ ] 1.2 DDL: таблица junk-категорий; сид текущими 17 категориями и
-      business-guard regex из `preprocess_worker.py`.
+      exact-dedup ключа. Накачено 2026-07-20 на `mvp_db`, схема
+      `agent_1_v5` (PG16, pgvector 0.6.0, пакет `postgresql-16-pgvector`),
+      без затрагивания схемы `agent_1`; структура `clean_posts` сверена
+      через `\d` — 4 таблицы, PK/FK/partial unique index как в спеке.
+- [x] 1.2 DDL: таблица junk-категорий; сид текущими 17 категориями и
+      business-guard regex из `preprocess_worker.py`. Сид сверен построчно
+      с кодом до накатки (число regex-фрагментов совпало по всем 17
+      категориям); после накатки подтверждено 18 строк в
+      `agent_1_v5.junk_categories` с ожидаемым числом паттернов на каждую.
 - [ ] 1.3 Скрипт миграции: `agent_1.raw_items` → `raw_posts` (разбор
       склеенных полей в атомарные, резолв `source`),
       `clean_items` → `clean_posts` (включая перенос вердиктов
