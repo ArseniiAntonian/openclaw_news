@@ -23,7 +23,13 @@
       склеенных полей в атомарные, резолв `source`),
       `clean_items` → `clean_posts` (включая перенос вердиктов
       отбраковки из `raw_items.source_metadata.preprocess` в
-      `drop_reason`).
+      `drop_reason`). Написан `agents/agent_1/src/agent_1/migrate_v5.py`
+      (батчи, идемпотентен на повтор, `--dry-run` в одной откатываемой
+      транзакции, savepoint на content_hash-коллизии); DDL-довесок
+      `003_source_name_unique.sql` (уникальность `source.name_source` —
+      нужна для идемпотентного upsert источников). Инструкция для
+      OpenClaw — `agents/agent_1/db/v5/DATA_MIGRATION.md`. Не отмечено
+      done: ждём прогона `--dry-run` и реального запуска на `mvp_db`.
 - [ ] 1.4 Прогон миграции на копии БД; сверка счётчиков (raw, clean,
       отбраковка по причинам) со старой схемой.
 
