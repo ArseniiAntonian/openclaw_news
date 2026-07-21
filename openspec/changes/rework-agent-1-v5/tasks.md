@@ -149,9 +149,13 @@
 
 ## 5. Статистика источников
 
-- [ ] 5.1 SQL-view (или таблица + расписание): `total_raw, pct_junk,
+- [~] 5.1 SQL-view `agent_1_v5.source_stats` написан
+      (`db/v5/004_source_stats_view.sql`): `total_raw, processed, pct_junk,
       pct_non_russian, pct_duplicates, avg_content_len, last_seen_at` по
-      `ID_source` из `raw_posts`+`clean_posts`.
+      `id_source` из `raw_posts`+`clean_posts`. Проценты — над processed (не
+      total_raw), чтобы 55767 unprocessed не занижали метрики до конца
+      бэкфилла. Не отмечено done: ждём накатки + sanity-проверки на `mvp_db`
+      через OpenClaw.
 
 ## 6. Приёмка
 
