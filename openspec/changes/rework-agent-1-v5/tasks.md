@@ -83,9 +83,18 @@
       Отдельно замерить `build_minhash_signature_from_shingles` изолированно
       (без I/O) — сверить с прежней цифрой ~22 мс/док на реальных данных
       перед тем, как проектировать под неё.
-- [ ] 3.2 Батчевый claim (`FOR UPDATE SKIP LOCKED LIMIT 100`) + запись
-      пачки одной транзакцией (bulk-вставка `clean_posts` + один update
-      статусов), upsert по `ID_raw_post`.
+- [ ] 3.2 Переписать I/O-слой воркера под v5-схему (design.md D9): claim —
+      anti-join `raw_posts` без строки `clean_posts`, `FOR UPDATE OF
+      raw_posts SKIP LOCKED LIMIT 100` (без отдельной очереди
+      `processing_jobs`); обработка пачки в памяти; запись результатов
+      пачки **одной транзакцией** — одна bulk-вставка в `clean_posts`
+      (`execute_values`/`COPY`), вердикт в `drop_reason`/`is_duplicate`/
+      `id_canonical_post`/`content_hash`. Per-document транзакции запрещены.
+      `content` читается из `raw_posts.content` (уже атомарный, извлечение
+      из `raw_payload` не нужно). Идемпотентность — сам anti-join
+      (обработанные raw не возвращаются) + `UNIQUE(id_raw_post)` как
+      бэкстоп. Язык `clean_posts` не хранит (ru-only, `non_russian` —
+      через `drop_reason`).
 - [ ] 3.3 MinHash: заменить схему хэш-миксинга `(a*x+b) mod (2⁶¹−1)` на
       нативно `uint64`-векторизуемую `(x XOR mask_i) * odd_multiplier_i`
       (128 масок/множителей вместо 128 пар `(a,b)`), считать через numpy
@@ -99,18 +108,26 @@
       схемы влияет только на recall LSH-кандидатов (design.md, Risks).
       Бенчмарк-ориентир ≤6 мс/док на ядро для сигнатуры+хэширования шинглов
       вместе — на реальном корпусе, не синтетике.
-- [ ] 3.4 In-memory LSH-индекс в воркере; БД — только
-      fallback-подтверждение между воркерами. `NearDuplicateEntry`
-      кэширует `shingles` наравне с `signature`/`band_keys` (design.md
-      D8) — `find_near_duplicate` берёт шинглы кандидата из кэша, а не
-      пересчитывает `build_shingles()` заново на каждый запрос/кандидата.
-- [ ] 3.5 Junk-фильтр читает категории из таблицы БД (кэш в памяти
-      процесса); отбраковка пишет `drop_reason` в `clean_posts`.
-- [ ] 3.6 Multiprocessing по ядрам; замер: ≤25 мс/док на ядро,
-      ≥400k raw/час на 4 ядрах.
-- [ ] 3.7 cProfile «после» (те же 100 документов); отчёт до/после — в PR.
-- [ ] 3.8 Адаптировать `tests/test_preprocess_worker.py` под новую схему и
-      батчевую механику.
+- [ ] 3.4 In-memory LSH-индекс в воркере (загрузка существующих
+      `clean_posts` news-строк на старте, как в v1); БД — fallback только
+      для exact-dedup (`content_hash`+UNIQUE). Кэш шинглов в
+      `NearDuplicateEntry` (design.md D8) — **объём решается по замеру 3.1**:
+      если `build_shingles` в near-dup пути доминирует — берём кэш (полный
+      или LRU-ограниченный при риске по памяти, ~1.4 ГБ на 50k news);
+      если нет — не усложняем.
+- [ ] 3.5 Junk-фильтр читает категории из таблицы `agent_1_v5.junk_categories`
+      (кэш в памяти процесса, `is_business_guard` → guard-паттерн);
+      отбраковка пишет `drop_reason='junk:<категория>'` в `clean_posts`.
+- [ ] 3.6 Multiprocessing по ядрам для стационарного инкремента; **начальный
+      bulk-бэкфилл 55k — одним воркером** (design.md D10: иначе near-dup
+      между слайсами теряются, пробивает бюджет 0.5%). Замер: ≤25 мс/док на
+      ядро, ≥400k raw/час на 4 ядрах.
+- [ ] 3.7 cProfile «после» (те же 100 документов, реальный корпус); отчёт
+      до/после — в PR.
+- [ ] 3.8 Адаптировать `tests/test_preprocess_worker.py` под v5-схему
+      (`clean_posts`, anti-join claim, батчевую механику); тесты
+      корректности новой MinHash-схемы (сигнатура детерминирована, recall
+      кандидатов сохраняется) и junk-из-БД.
 
 ## 4. Эмбеддинги
 
