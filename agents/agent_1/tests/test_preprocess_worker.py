@@ -6,11 +6,14 @@ import unittest
 os.environ.setdefault("AGENT_1_DB_DSN", "postgresql://placeholder")
 
 from agent_1.preprocess_worker import (  # noqa: E402
+    MAX_HASH,
     MINHASH_BANDS,
     MINHASH_SIZE,
     build_dedup_document_text,
     build_lsh_band_keys,
     build_minhash_signature,
+    build_minhash_signature_from_shingles,
+    build_shingles,
     classify_junk_topic,
     detect_language,
     extract_text_value,
@@ -211,6 +214,43 @@ class PreprocessWorkerTests(unittest.TestCase):
         self.assertEqual(len(band_keys), MINHASH_BANDS)
         self.assertIn((0, (0, 1, 2, 3)), band_keys)
         self.assertIn((MINHASH_BANDS - 1, (124, 125, 126, 127)), band_keys)
+
+    def test_minhash_signature_is_deterministic_and_sized(self) -> None:
+        shingles = build_shingles(
+            normalize_dedup_text("компания открыла новый завод в казани сегодня утром")
+        )
+        first = build_minhash_signature_from_shingles(shingles)
+        second = build_minhash_signature_from_shingles(shingles)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), MINHASH_SIZE)
+        self.assertTrue(all(isinstance(value, int) for value in first))
+
+    def test_minhash_empty_shingles_is_all_max(self) -> None:
+        self.assertEqual(
+            build_minhash_signature_from_shingles(frozenset()),
+            tuple(MAX_HASH for _ in range(MINHASH_SIZE)),
+        )
+
+    def test_minhash_estimates_true_jaccard(self) -> None:
+        # Fraction of equal signature positions must track the true Jaccard of
+        # the shingle sets (unbiasedness of the (x XOR mask) * mult scheme). Raw
+        # random int shingle hashes keep the relationship exact and cheap.
+        import random
+
+        rng = random.Random(0)
+        pool = [rng.getrandbits(64) for _ in range(2000)]
+        base = set(rng.sample(pool, 400))
+        kept = set(rng.sample(sorted(base), 360))  # target ~0.8 Jaccard
+        while len(kept) < 400:
+            kept.add(rng.choice(pool))
+        left, right = frozenset(base), frozenset(kept)
+
+        true_jaccard = len(left & right) / len(left | right)
+        estimate = signature_similarity(
+            build_minhash_signature_from_shingles(left),
+            build_minhash_signature_from_shingles(right),
+        )
+        self.assertAlmostEqual(estimate, true_jaccard, delta=0.12)
 
     def test_preprocess_text_uses_payload_when_raw_text_missing(self) -> None:
         title, clean_text, language = preprocess_text(

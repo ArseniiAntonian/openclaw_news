@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import psycopg
 from psycopg.rows import dict_row
 
@@ -812,39 +813,51 @@ def build_shingles(
     return frozenset(shingles)
 
 
-def build_minhash_permutations(
+# MinHash mixing parameters for the (x XOR mask_i) * mult_i scheme.
+#
+# This replaced the earlier (a*x + b) mod (2**61-1) scheme (rework-agent-1-v5
+# task 3.3). The old formula could not be vectorized: a*x overflows uint64 for
+# 61-bit operands, forcing numpy into object-dtype (Python-speed) arithmetic, so
+# the per-doc signature stayed a nested Python loop measured at ~150 ms/doc on
+# the real corpus (the dominant cost of the whole worker; see design.md D5).
+# This scheme uses natural uint64 wraparound so the 128-permutation min-hash is a
+# single numpy broadcast, dropping the signature to a few ms/doc.
+#
+# The parameters MUST be identical across every worker and every run, otherwise
+# signatures computed by different processes are incomparable. They are derived
+# deterministically from fixed seeds (hash64 of a fixed string), never from an
+# unseeded RNG. Multipliers are forced odd so `* mult` is a bijection on uint64
+# (no shingle information collapses to 0).
+def build_minhash_mixers(
     signature_size: int = MINHASH_SIZE,
-) -> tuple[tuple[int, int], ...]:
-    permutations: list[tuple[int, int]] = []
+) -> tuple[np.ndarray, np.ndarray]:
+    masks = np.empty(signature_size, dtype=np.uint64)
+    mults = np.empty(signature_size, dtype=np.uint64)
     for index in range(signature_size):
-        a = hash64(f"a-{index}") % MERSENNE_PRIME
-        b = hash64(f"b-{index}") % MERSENNE_PRIME
-        if a == 0:
-            a = index + 1
-        permutations.append((a, b))
-    return tuple(permutations)
+        masks[index] = np.uint64(hash64(f"mask-{index}"))
+        mults[index] = np.uint64(hash64(f"mult-{index}") | 1)  # force odd
+    return masks, mults
 
 
-MINHASH_PERMUTATIONS = build_minhash_permutations()
+MINHASH_MASKS, MINHASH_MULTIPLIERS = build_minhash_mixers()
 
 
 def build_minhash_signature_from_shingles(
     shingles: frozenset[int],
     *,
-    permutations: tuple[tuple[int, int], ...] = MINHASH_PERMUTATIONS,
+    masks: np.ndarray = MINHASH_MASKS,
+    mults: np.ndarray = MINHASH_MULTIPLIERS,
 ) -> tuple[int, ...]:
     if not shingles:
-        return tuple(MAX_HASH for _ in permutations)
+        return tuple(MAX_HASH for _ in range(len(masks)))
 
-    signature: list[int] = []
-    for a, b in permutations:
-        minimum = MAX_HASH
-        for shingle in shingles:
-            candidate = (a * shingle + b) % MERSENNE_PRIME
-            if candidate < minimum:
-                minimum = candidate
-        signature.append(minimum)
-    return tuple(signature)
+    # (N,) shingle hashes -> (128, N) mixed values -> per-permutation column min.
+    # uint64 multiply wraps mod 2**64 natively; the high bits (which dominate the
+    # min ordering) are well mixed by the odd multiply.
+    s = np.fromiter(shingles, dtype=np.uint64, count=len(shingles))
+    mixed = (s[np.newaxis, :] ^ masks[:, np.newaxis]) * mults[:, np.newaxis]
+    signature = mixed.min(axis=1)
+    return tuple(int(value) for value in signature)
 
 
 def build_minhash_signature(
