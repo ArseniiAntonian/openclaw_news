@@ -21,7 +21,7 @@ GLiNER + драйверный слой, оценка релевантности 
 - Новая схема хранения Агента 1 по ERD v5 (`docs/architecture/schema_v5.dot`):
   `source` → `raw_posts` → `clean_posts` (Postgres + pgvector, LZ4-компрессия
   контента, композитный PK с `time_post` как задел под партиционирование).
-- Эмбеддинги переезжают в Агент 1: `text-embedding-3-large`,
+- Эмбеддинги переезжают в Агент 1: `text-embedding-3-small`,
   `dimensions=1024`, колонка `clean_posts.embedding vector(1024)`,
   HNSW-индекс только на ней.
 - **BREAKING**: удаление всех LLM-шагов из Агента 1 — воркеры
@@ -56,7 +56,7 @@ GLiNER + драйверный слой, оценка релевантности 
 
 ### New Capabilities
 - `agent_1-embeddings`: генерация эмбеддингов для чистых недубликатов
-  (`text-embedding-3-large`, dims=1024, батчи, идемпотентность, HNSW после
+  (`text-embedding-3-small`, dims=1024, батчи, идемпотентность, HNSW после
   bulk-загрузки).
 - `agent_1-source-stats`: агрегируемая статистика качества по источникам
   (`total_raw, pct_junk, pct_non_russian, pct_duplicates, avg_content_len,
@@ -94,7 +94,7 @@ GLiNER + драйверный слой, оценка релевантности 
   `agent_1.raw_items` / `clean_items`.
 - Тесты: `tests/test_preprocess_worker.py` адаптируется; тесты LLM-воркеров
   замораживаются вместе с кодом.
-- Внешние зависимости: API эмбеддингов (text-embedding-3-large), numpy,
+- Внешние зависимости: API эмбеддингов (text-embedding-3-small), numpy,
   pgvector.
 - Downstream: Агент 3 читает `clean_posts.embedding` и пишет
   `clean_posts.ID_cluster` (сознательное отступление от стадийности,

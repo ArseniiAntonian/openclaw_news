@@ -139,7 +139,7 @@
 
 ## 4. Эмбеддинги
 
-- [ ] 4.1 Embedding-воркер: `text-embedding-3-large`, `dimensions=1024`,
+- [ ] 4.1 Embedding-воркер: `text-embedding-3-small`, `dimensions=1024`,
       батчи до лимита API, только `drop_reason IS NULL AND
       is_duplicate=false`, пропуск при `embedding IS NOT NULL`.
 - [ ] 4.2 Bulk-прогон корпуса; построение HNSW (`vector_cosine_ops`) после

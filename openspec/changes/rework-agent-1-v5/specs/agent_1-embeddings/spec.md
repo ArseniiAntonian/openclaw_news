@@ -2,7 +2,7 @@
 
 ### Requirement: Генерация эмбеддингов для чистых недубликатов
 Embedding-воркер MUST генерировать эмбеддинги моделью
-`text-embedding-3-large` с параметром `dimensions=1024` и записывать их в
+`text-embedding-3-small` с параметром `dimensions=1024` и записывать их в
 `clean_posts.embedding vector(1024)`. Эмбеддинг MUST вычисляться только для
 строк `clean_posts` с `drop_reason IS NULL` и `is_duplicate=false`.
 

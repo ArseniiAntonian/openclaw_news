@@ -19,7 +19,7 @@ impact, tonality, entities, events) из Агента 1 уходит: сущно
 
 - Новая схема хранения: `source` → `raw_posts` → `clean_posts` (разделение сырого
   и очищенного, как в текущей agent_1, но с новыми полями).
-- Эмбеддинги переезжают в Агент 1: `text-embedding-3-large`, `dimensions=1024`,
+- Эмбеддинги переезжают в Агент 1: `text-embedding-3-small`, `dimensions=1024`,
   колонка `clean_posts.embedding vector(1024)`.
 - Удаление всех LLM-шагов из воркеров Агента 1 (**BREAKING**: таблицы
   `document_enrichments`, `document_kr_labels` больше не наполняются Агентом 1).
@@ -118,7 +118,7 @@ dup_score float, embedding vector(1024), cleaned_at timestamptz`
 
 ## Требование 4: Эмбеддинги
 
-- Модель `text-embedding-3-large` с параметром `dimensions=1024`.
+- Модель `text-embedding-3-small` с параметром `dimensions=1024`.
 - Вызовы **батчами** (до лимита API), не по одному документу.
 - Только для чистых недубликатов (см. сценарий выше).
 - HNSW-индекс `vector_cosine_ops` на `clean_posts.embedding`; при массовой
