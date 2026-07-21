@@ -87,18 +87,17 @@
       4538 → кэш шинглов ~1.7 ГБ на 50k (D8 пересмотрен: по умолчанию не
       кэшируем). Приоритет стадии переставлен: смена MinHash-схемы (3.3) —
       основной рычаг, делаем первой; I/O (3.2) — не throughput-рычаг.
-- [ ] 3.2 Переписать I/O-слой воркера под v5-схему (design.md D9): claim —
-      anti-join `raw_posts` без строки `clean_posts`, `FOR UPDATE OF
-      raw_posts SKIP LOCKED LIMIT 100` (без отдельной очереди
-      `processing_jobs`); обработка пачки в памяти; запись результатов
-      пачки **одной транзакцией** — одна bulk-вставка в `clean_posts`
-      (`execute_values`/`COPY`), вердикт в `drop_reason`/`is_duplicate`/
-      `id_canonical_post`/`content_hash`. Per-document транзакции запрещены.
-      `content` читается из `raw_posts.content` (уже атомарный, извлечение
-      из `raw_payload` не нужно). Идемпотентность — сам anti-join
-      (обработанные raw не возвращаются) + `UNIQUE(id_raw_post)` как
-      бэкстоп. Язык `clean_posts` не хранит (ru-only, `non_russian` —
-      через `drop_reason`).
+- [~] 3.2 I/O-слой воркера под v5-схему написан: новый модуль
+      `src/agent_1/preprocess_v5.py`. Claim — anti-join `raw_posts` без
+      строки `clean_posts`, `FOR UPDATE OF raw_posts SKIP LOCKED LIMIT 100`,
+      claim+запись в одной транзакции (D9); two-phase bulk-insert в
+      `clean_posts` (kept с `RETURNING id`, затем дубли по карте
+      `id_raw_post→id_clean_post` — решает self-FK `id_canonical_post`);
+      `content` из `raw_posts.content`; язык не хранится (`non_russian` в
+      `drop_reason`). Чистая логика (verdict, two-phase резолв) покрыта
+      юнит-тестами `tests/test_preprocess_v5.py`. **DB-интеграция (реальный
+      claim/bulk-write) — за прогоном OpenClaw (не отмечено done).**
+      Старый `preprocess_worker.py` остаётся легаси-референсом.
 - [x] 3.3 MinHash: схема хэш-миксинга заменена на нативно
       `uint64`-векторизуемую `(x XOR mask_i) * odd_multiplier_i` (128
       масок/множителей, детерминированы от фикс-сидов, множители нечётные),
@@ -116,20 +115,21 @@
       compute ~29 мс/док уже укладывается в цель (400k/час на 4 ядрах);
       замену хэша шинглов гейтим на реальный re-measure (3.7) — делаем
       только если по факту не хватит.
-- [ ] 3.4 In-memory LSH-индекс в воркере (загрузка существующих
-      `clean_posts` news-строк на старте, как в v1); БД — fallback только
-      для exact-dedup (`content_hash`+UNIQUE). Кэш шинглов в
-      `NearDuplicateEntry` (design.md D8) — **объём решается по замеру 3.1**:
-      если `build_shingles` в near-dup пути доминирует — берём кэш (полный
-      или LRU-ограниченный при риске по памяти, ~1.4 ГБ на 50k news);
-      если нет — не усложняем.
-- [ ] 3.5 Junk-фильтр читает категории из таблицы `agent_1_v5.junk_categories`
-      (кэш в памяти процесса, `is_business_guard` → guard-паттерн);
-      отбраковка пишет `drop_reason='junk:<категория>'` в `clean_posts`.
-- [ ] 3.6 Multiprocessing по ядрам для стационарного инкремента; **начальный
-      bulk-бэкфилл 55k — одним воркером** (design.md D10: иначе near-dup
-      между слайсами теряются, пробивает бюджет 0.5%). Замер: ≤25 мс/док на
-      ядро, ≥400k raw/час на 4 ядрах.
+- [x] 3.4 In-memory LSH в `preprocess_v5.py`: `DedupState` грузится из
+      существующих kept `clean_posts` на старте (`load_dedup_state`, JOIN к
+      `raw_posts` за title), растёт по ходу; exact-dedup через `content_hash`
+      + partial UNIQUE. Кэш шинглов **не вводим** (D8 пересмотрен после 3.1):
+      шинглы кандидата пересчитываются при band-коллизии, экономим ~1.7 ГБ.
+- [x] 3.5 Junk из `agent_1_v5.junk_categories` (`load_junk_state` +
+      `build_junk_state_from_rows`, кэш в памяти процесса, `is_business_guard`
+      → guard-паттерн через тот же `compile_pattern`); отбраковка пишет
+      `drop_reason='junk:<категория>'`. `classify_junk_topic` в
+      `preprocess_worker.py` рефакторнут под прокидываемые паттерны
+      (идентичная логика старому и v5). Покрыто тестами.
+- [ ] 3.6 Multiprocessing — **гейтится на re-measure 3.7** (как blake2b):
+      по 3.1 одно ядро при ~29 мс/док уже даёт ~124k/час/ядро > целевых
+      100k, т.е. может не понадобиться. Начальный bulk-бэкфилл 55k в любом
+      случае одним воркером (D10). Строим только если 3.7 покажет нехватку.
 - [ ] 3.7 cProfile «после» (те же 100 документов, реальный корпус); отчёт
       до/после — в PR.
 - [ ] 3.8 Адаптировать `tests/test_preprocess_worker.py` под v5-схему

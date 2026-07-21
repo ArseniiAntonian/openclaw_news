@@ -1291,9 +1291,14 @@ def collect_pattern_matches(
     return tuple(matches)
 
 
-def has_protected_business_context(clean_title: str | None, clean_text: str) -> bool:
+def has_protected_business_context(
+    clean_title: str | None,
+    clean_text: str,
+    *,
+    guard_re: re.Pattern[str] = PROTECTED_BUSINESS_CONTEXT_RE,
+) -> bool:
     combined = "\n".join(part for part in (clean_title, clean_text) if part)
-    return bool(PROTECTED_BUSINESS_CONTEXT_RE.search(combined))
+    return bool(guard_re.search(combined))
 
 
 def classify_junk_topic(
@@ -1301,16 +1306,22 @@ def classify_junk_topic(
     clean_title: str | None,
     clean_text: str,
     document_type: str | None,
+    junk_patterns: list[tuple[str, re.Pattern[str]]] = JUNK_PATTERNS,
+    guard_re: re.Pattern[str] = PROTECTED_BUSINESS_CONTEXT_RE,
 ) -> dict[str, Any] | None:
+    # junk_patterns/guard_re default to the module's hardcoded set (the v1
+    # worker) but can be passed in -- the v5 worker loads them from the
+    # agent_1_v5.junk_categories table so the matching logic here stays
+    # identical between the two.
     if document_type != "news":
         return None
     if not clean_text.strip():
         return None
-    if has_protected_business_context(clean_title, clean_text):
+    if has_protected_business_context(clean_title, clean_text, guard_re=guard_re):
         return None
 
     title = clean_title or ""
-    for category, pattern in JUNK_PATTERNS:
+    for category, pattern in junk_patterns:
         title_matches = collect_pattern_matches(pattern, title)
         body_matches = collect_pattern_matches(pattern, clean_text)
         if not title_matches and len(body_matches) < JUNK_REGEX_MIN_BODY_HITS:
