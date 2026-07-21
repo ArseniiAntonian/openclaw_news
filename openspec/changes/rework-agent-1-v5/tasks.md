@@ -139,13 +139,24 @@
 
 ## 4. Эмбеддинги
 
-- [ ] 4.1 Embedding-воркер: `text-embedding-3-small`, `dimensions=1024`,
-      батчи до лимита API, только `drop_reason IS NULL AND
-      is_duplicate=false`, пропуск при `embedding IS NOT NULL`.
-- [ ] 4.2 Bulk-прогон корпуса; построение HNSW (`vector_cosine_ops`) после
-      заливки.
-- [ ] 4.3 Тесты: идемпотентность (0 вызовов на повторе), «дубликат не
-      эмбеддится».
+- [~] 4.1 Embedding-воркер написан: `src/agent_1/embed_v5.py` через
+      **OpenRouter** (`openai/text-embedding-3-small`, OpenAI-совместимый
+      `/embeddings`, `requests`, `OPENROUTER_API_KEY`). Claim только
+      `drop_reason IS NULL AND is_duplicate=false AND embedding IS NULL`
+      (FOR UPDATE SKIP LOCKED — эмбеддинг API-bound, параллелится);
+      батчи; идемпотентность через `embedding IS NULL`. **Dimensions:**
+      OpenRouter не документирует `dimensions`, поэтому не зависим от него —
+      запрашиваем `dimensions=1024`, но defensively обрезаем первые 1024 +
+      L2-ренорм на клиенте (Matryoshka-эквивалент серверной обрезки).
+      Чистая логика (truncate/normalize, parse, vector-literal, cap) —
+      9 юнит-тестов. **API-прогон — за OpenClaw (нужен ключ в .env).**
+- [~] 4.2 HNSW-индекс написан (`db/v5/005_embedding_hnsw.sql`,
+      `vector_cosine_ops`, строить ПОСЛЕ заливки). Bulk-прогон + накатка
+      индекса — за OpenClaw.
+- [ ] 4.3 Тесты идемпотентности («дубликат/отбракованный не эмбеддится» —
+      гарантировано claim-условием; «0 вызовов на повторе» — проверяется
+      на реальном прогоне OpenClaw, т.к. это про SQL-claim, не про чистую
+      функцию).
 
 ## 5. Статистика источников
 
