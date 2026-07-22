@@ -422,6 +422,7 @@ def run(
     *,
     batch_size: int,
     once: bool,
+    drain: bool,
     poll_interval: float,
     max_docs: int | None,
     log,
@@ -436,7 +437,10 @@ def run(
         batch = claim_batch(conn, batch_size)
         if not batch:
             conn.rollback()  # release the (empty) transaction
-            if once:
+            # --drain exits when the backlog is empty (backfill: one process,
+            # one cache load, process everything, then stop). --once exits
+            # after a single batch. Otherwise poll for new work forever.
+            if once or drain:
                 break
             time.sleep(poll_interval)
             continue
@@ -466,6 +470,8 @@ def run(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="v5 preprocessing worker")
     ap.add_argument("--once", action="store_true", help="process one batch and exit")
+    ap.add_argument("--drain", action="store_true",
+                    help="process until the backlog is empty, then exit (backfill mode)")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     ap.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL_SECONDS)
     ap.add_argument("--max-docs", type=int, default=None)
@@ -482,12 +488,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         log(
             f"Starting v5 preprocess worker batch_size={args.batch_size} "
-            f"once={args.once} threshold={NEAR_DUPLICATE_THRESHOLD}"
+            f"once={args.once} drain={args.drain} threshold={NEAR_DUPLICATE_THRESHOLD}"
         )
         return run(
             conn,
             batch_size=args.batch_size,
             once=args.once,
+            drain=args.drain,
             poll_interval=args.poll_interval,
             max_docs=args.max_docs,
             log=log,
