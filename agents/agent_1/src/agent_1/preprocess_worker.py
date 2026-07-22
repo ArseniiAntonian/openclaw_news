@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import unicodedata
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -781,8 +782,21 @@ def build_word_shingles(
 
 
 def hash64(value: str) -> int:
+    # 64-bit deterministic hash. Used only for deriving the MinHash mask/
+    # multiplier parameters (256 calls at import), where the full 64-bit width
+    # matters. NOT used on the hot shingle path -- see hash_shingle.
     digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=False)
+
+
+def hash_shingle(value: str) -> int:
+    # Hot-path shingle hash. crc32 is ~2x faster than blake2b (C, no per-call
+    # object) and was the dominant cost of build_shingles / the startup dedup
+    # cache load (rework-agent-1-v5 3.7 re-measure: hash64 = 13.9s of a 23.8s
+    # cache load). 32-bit is fine here: the MinHash mixing scheme lifts these
+    # to 64-bit via the masks/multipliers, and collision risk at ~2000
+    # shingles/doc is negligible (~5e-4). Deterministic across runs/workers.
+    return zlib.crc32(value.encode("utf-8"))
 
 
 def build_shingles(
@@ -796,19 +810,19 @@ def build_shingles(
 
     if tokens:
         if len(tokens) < shingle_size:
-            shingles.add(hash64(f"w:{normalized_text}"))
+            shingles.add(hash_shingle(f"w:{normalized_text}"))
         else:
             for index in range(len(tokens) - shingle_size + 1):
                 shingle = " ".join(tokens[index : index + shingle_size])
-                shingles.add(hash64(f"w:{shingle}"))
+                shingles.add(hash_shingle(f"w:{shingle}"))
 
     if char_shingle_size > 0 and normalized_text:
         compact_text = re.sub(r"\s+", " ", normalized_text).strip()
         if len(compact_text) <= char_shingle_size:
-            shingles.add(hash64(f"c:{compact_text}"))
+            shingles.add(hash_shingle(f"c:{compact_text}"))
         else:
             for index in range(len(compact_text) - char_shingle_size + 1):
-                shingles.add(hash64(f"c:{compact_text[index:index + char_shingle_size]}"))
+                shingles.add(hash_shingle(f"c:{compact_text[index:index + char_shingle_size]}"))
 
     return frozenset(shingles)
 
