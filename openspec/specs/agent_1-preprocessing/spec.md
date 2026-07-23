@@ -3,28 +3,98 @@
 ## Purpose
 
 Cleanup, определение языка (ru-only), junk-topic regex-фильтрация с
-business-guard, exact dedup, MinHash near-dup (`preprocess_worker.py`).
-Снимок «как есть» на 2026-07-17 (change `document-agent-1-pipeline`).
+business-guard (категории — из таблицы БД), трёхступенчатая дедупликация
+(exact, векторизованный MinHash near-dup, точный Jaccard confirm), запись
+вердикта в `agent_1_v5.clean_posts` (`src/agent_1/preprocess_v5.py`).
+
+> Синкнуто из change `rework-agent-1-v5` (2026-07-23). Провалидировано
+> реальным бэкфиллом 57k (99.92% эквивалентность со старым воркером,
+> 442k/час на одном ядре без multiprocessing). Легаси-воркер
+> `preprocess_worker.py` остаётся в репо как источник переиспользуемых
+> чистых функций (нормализация, шинглы, MinHash) и как референс (D6), но
+> сам по себе `agent_1.clean_items` больше не пополняет.
 
 ## Requirements
 
+### Requirement: Схема clean_posts и вердикт очистки
+Агент 1 MUST владеть таблицей `clean_posts` (схема v5): `ID_clean_post,
+ID_raw_post FK, ID_canonical_post FK (self-ref, nullable), ID_cluster FK
+(nullable, пишет Агент 3 — сознательное отступление от стадийности),
+clean_content text (LZ4), is_duplicate bool, dup_score float,
+embedding vector(1024), cleaned_at timestamptz`, плюс поле статуса/
+`drop_reason`.
+
+Инвариант: **clean_posts = вердикт очистки по каждому обработанному raw**.
+Каждый обработанный `raw_posts` MUST получать ровно одну строку
+`clean_posts`; отбраковка выражается заполненным `drop_reason`
+(`non_russian`, `junk:<категория>`, `duplicate`), а не отсутствием строки.
+Отбракованные строки не получают `embedding`.
+
+#### Scenario: Документ отбракован фильтром
+- **WHEN** документ не прошёл фильтр языка или junk-фильтр
+- **THEN** строка `clean_posts` создаётся с `drop_reason`
+  (`non_russian` или `junk:<категория>`), без `embedding`
+
+#### Scenario: Причина отбраковки доступна для статистики
+- **WHEN** статистика источников агрегирует качество по `ID_source`
+- **THEN** доли junk/non-russian/duplicates вычисляются из `drop_reason` и
+  `is_duplicate` в `clean_posts` одним запросом, без JOIN с лог-таблицами
+
 ### Requirement: Триггер preprocessing и claim job'ов
-`preprocess_worker` MUST забирать строки `agent_1.processing_jobs` с
-`job_type='preprocess'` через `FOR UPDATE SKIP LOCKED`, чтобы несколько
-воркеров могли работать параллельно без двойной обработки одного job'а.
+`preprocess_v5` MUST определять «ожидающие обработки» документы как
+`raw_posts`, для которых ещё нет строки `clean_posts` (отсутствие вердикта
+= pending), без отдельной таблицы-очереди `processing_jobs`. Claim MUST
+выполняться пачками через anti-join `NOT EXISTS (clean_posts)` с
+`FOR UPDATE OF raw_posts SKIP LOCKED LIMIT 100`, чтобы несколько воркеров
+работали параллельно без двойной обработки и без per-document round-trips.
+Блокировка `raw_posts`-строк удерживается до commit пачки (запись
+`clean_posts`), после чего снимается.
 
 #### Scenario: Два воркера запущены одновременно
-- **WHEN** два процесса `preprocess_worker` одновременно пытаются забрать
-  job'ы из очереди `pending`
-- **THEN** каждый `pending` job обрабатывается ровно одним воркером
+- **WHEN** два процесса `preprocess_v5` одновременно берут пачку
+  необработанных `raw_posts`
+- **THEN** `SKIP LOCKED` разводит их по разным строкам, каждый raw
+  обрабатывается ровно одним воркером, claim выполняется пачками
+
+#### Scenario: Документ уже обработан (идемпотентность/повтор)
+- **WHEN** для `raw_posts`-строки уже существует строка `clean_posts`
+  (любой вердикт)
+- **THEN** anti-join её не возвращает, повторной обработки не происходит,
+  новых строк не создаётся
+
+### Requirement: Junk-категории в таблице БД
+Junk-regex категории MUST храниться в таблице `agent_1_v5.junk_categories`
+и пополняться без деплоя кода (стартовое наполнение — 17 категорий
+`weather`, `winter_holiday_noise`, `traffic_and_pdd`, `school_incidents`,
+`crime_and_fraud`, `animals`, `family_and_newborns`, `health_and_sleep`,
+`beauty_and_fashion`, `lifestyle_and_food`, `food_and_meals`,
+`religion_and_obituaries`, `sports`, `celebrities_and_gossip`,
+`transport_and_airport`, `gardening_and_hobby`,
+`missing_persons_and_searches` + business-guard
+`PROTECTED_BUSINESS_CONTEXT_RE`). Воркер MUST кэшировать активные правила в
+памяти (перечитывание на старте процесса), а не читать таблицу на каждый
+документ.
+
+#### Scenario: Добавлена новая junk-категория
+- **WHEN** оператор добавляет новую категорию в таблицу
+- **THEN** после перезапуска (или планового перечитывания) воркер применяет
+  её без деплоя кода
+
+#### Scenario: Business-guard сохраняется
+- **WHEN** документ совпадает с junk-категорией, но содержит защищённый
+  бизнес-контекст
+- **THEN** документ не отбраковывается (текущее поведение business-guard
+  сохраняется)
 
 ### Requirement: Очистка и нормализация текста
-`preprocess_worker` MUST выполнять извлечение текста из `raw_payload` (когда
-`raw_text` отсутствует), html-очистку, unicode- и whitespace-нормализацию, а
-также лёгкую очистку типового англоязычного boilerplate-мусора (маркеры вида
-`Your browser does not support the video tag`, `Don't Miss`, `Most Read`,
-`Read Next`, `Related Articles`, `Recommended`), включая разлепление
-склеенных токенов вроде `TuesdayDon't` перед поиском этих маркеров.
+`preprocess_v5` MUST выполнять html-очистку, unicode- и
+whitespace-нормализацию, а также лёгкую очистку типового англоязычного
+boilerplate-мусора (маркеры вида `Your browser does not support the video
+tag`, `Don't Miss`, `Most Read`, `Read Next`, `Related Articles`,
+`Recommended`), включая разлепление склеенных токенов вроде
+`TuesdayDon't` перед поиском этих маркеров. `raw_posts.content` уже
+атомарный (заполняется на ingestion) — извлечения из вложенного payload на
+этапе препроцессинга не требуется.
 
 #### Scenario: Текст содержит склеенный маркер boilerplate
 - **WHEN** очищаемый текст содержит склеенные токены вида `MissNews` рядом с
@@ -33,120 +103,148 @@ business-guard, exact dedup, MinHash near-dup (`preprocess_worker.py`).
   найденный мусорный блок
 
 ### Requirement: Определение языка и ru-only фильтрация
-`preprocess_worker` MUST классифицировать документ как русский или нет по
-объёму алфавитного текста и доле кириллических букв: минимум
-`min_alpha_chars=20` алфавитных символов и `min_russian_letter_ratio=0.55`
-доли кириллицы. Если после очистки текста достаточно алфавитных символов
-для классификации, но документ не проходит по доле кириллицы, worker
-MUST пометить `raw_items.source_metadata.preprocess.status='filtered_out'`
-с `reason='non_russian_text'`, закрыть job как `done` и не создавать строку
-`clean_items`.
+`preprocess_v5` MUST классифицировать документ как русский или нет по
+объёму алфавитного текста и доле кириллических букв (пороги текущей
+реализации: `min_alpha_chars=20`, `min_russian_letter_ratio=0.55`). Если
+документ не проходит по доле кириллицы, worker MUST записать строку
+`clean_posts` с `drop_reason='non_russian'` без `clean_content`-обработки
+downstream и без эмбеддинга.
 
 #### Scenario: Документ преимущественно на английском
-- **WHEN** очищенный текст содержит достаточно алфавитных символов для
-  классификации, но доля кириллических букв ниже `0.55`
-- **THEN** `clean_items`-строка не создаётся, а `raw_items` помечается
-  `status='filtered_out'`, `reason='non_russian_text'`
+- **WHEN** очищенный текст содержит достаточно алфавитных символов, но доля
+  кириллицы ниже `0.55`
+- **THEN** строка `clean_posts` получает `drop_reason='non_russian'`,
+  `embedding IS NULL`
 
 #### Scenario: Текста недостаточно для классификации языка
 - **WHEN** очищенный текст содержит меньше `min_alpha_chars=20` алфавитных
   символов
-- **THEN** worker не применяет фильтр `non_russian_text` по недостатку
-  данных для классификации
+- **THEN** worker не применяет фильтр `non_russian` по недостатку данных
 
 ### Requirement: Junk-topic regex-фильтрация с business-guard
-`preprocess_worker` MUST применять консервативный regex-слой из именованных
-категорий шумовых человеческих тем — `weather`, `winter_holiday_noise`,
-`traffic_and_pdd`, `school_incidents`, `crime_and_fraud`, `animals`,
-`family_and_newborns`, `health_and_sleep`, `beauty_and_fashion`,
-`lifestyle_and_food`, `food_and_meals`, `religion_and_obituaries`, `sports`,
-`celebrities_and_gossip`, `transport_and_airport`, `gardening_and_hobby`,
-`missing_persons_and_searches` — и не применять более широкие рискованные
-категории (война/геополитика, происшествия, эпидемии/медицина, ЖКХ, туризм,
-развлечения, крипто/consumer tech, соцвопросы и образование), так как они
-слишком часто скрывают бизнес-релевантные сигналы.
-
-Если документ совпадает с одной из активных junk-категорий И не содержит
-явного банковского/сберовского/бизнес-контекста
-(`PROTECTED_BUSINESS_CONTEXT_RE`: упоминания Сбера, банков, платежей,
-юрлиц, зарплатных проектов, GenAI/GigaChat, мобильного приложения,
-кибербезопасности и т.п.), worker MUST пометить
-`raw_items.source_metadata.preprocess.status='filtered_out'` с
-`reason='junk_topic_regex'` (и категорией совпадения), закрыть job как
-`done` и не создавать строку `clean_items`.
+`preprocess_v5` MUST применять junk-regex слой, читаемый из таблицы БД
+(см. «Junk-категории в таблице БД»), с сохранением business-guard: документ
+отбраковывается только при совпадении с активной категорией И отсутствии
+защищённого бизнес-контекста. Отбраковка записывается в `clean_posts` с
+`drop_reason='junk:<категория>'`.
 
 #### Scenario: Новость про погоду без бизнес-контекста
 - **WHEN** новость подходит под категорию `weather` и не содержит
   защищённых бизнес-терминов
-- **THEN** `clean_items`-строка не создаётся, `raw_items` помечается
-  `status='filtered_out'`, `reason='junk_topic_regex'`,
-  `junk_category='weather'`
+- **THEN** строка `clean_posts` получает `drop_reason='junk:weather'`
 
 #### Scenario: Новость про спорт с явным банковским контекстом
-- **WHEN** новость подходит под категорию `sports`, но также содержит
-  защищённый бизнес-термин (например, "банковская карта" или "GigaChat")
-- **THEN** business-guard предотвращает фильтрацию, и документ проходит
-  дальше в pipeline как обычно
+- **WHEN** новость подходит под категорию `sports`, но содержит защищённый
+  бизнес-термин
+- **THEN** business-guard предотвращает отбраковку, документ идёт дальше
 
 ### Requirement: Exact dedup по summary-independent ключу
-`preprocess_worker` MUST выполнять exact-дедуп по ключу, построенному из
-нормализованного `title + FULL clean_text` — этот ключ намеренно не зависит
-от `source_metadata.summary` и не обрезается лимитом near-dup контента, так
-что два побайтово идентичных документа с разными или отсутствующими
-summary всегда совпадают по этому ключу.
+Exact-дедуп MUST выполняться по hash нормализованного `title + полный
+контент`, проверяемому уникальным индексом в БД (`content_hash`, partial
+unique). Ключ намеренно не зависит от `metadata` (в т.ч. вендорского
+summary) и не обрезается лимитом near-dup контента: два побайтово
+идентичных документа всегда совпадают по этому ключу независимо от
+различий в metadata.
 
-#### Scenario: Два документа с одинаковым текстом, но разным summary
-- **WHEN** два `raw_items` имеют идентичные `title` и `clean_text`, но
-  разные значения `source_metadata.summary`
-- **THEN** второй документ распознаётся как точный дубликат первого
+#### Scenario: Два документа с одинаковым текстом, но разным metadata
+- **WHEN** два `raw_posts` имеют идентичные `title` и `content`, но разные
+  `metadata` (например, разные summary от вендора)
+- **THEN** второй документ распознаётся как точный дубликат первого через
+  уникальный индекс
 
 ### Requirement: MinHash near-dup фильтрация
-Near-dup текст MUST строиться отдельно от exact-ключа: из нормализованного
-`title + summary + content[:4000]`, токен-нормализованного (`lower()`,
-удаление пунктуации, `ё -> е`), хэшированного смешанными словными шинглами
-длиной `5` и символьными шинглами длиной `17`, пропущенного через `128`
-MinHash-перестановок (`MINHASH_SIZE=128`), с LSH-бэндингом `32` бэнда по `4`
-строки (`MINHASH_BANDS=32`, `MINHASH_ROWS_PER_BAND=4`, кандидатный порог
-similarity ≈`0.42`), и принятого как near-duplicate при точном
-Jaccard-сходстве шинглов не ниже `0.7` (`near_duplicate_threshold=0.7`).
-Near-dup фильтрация MUST применяться только к новостным (news-like)
-документам, а не ко всем `document_type`.
+Near-dup MUST использовать текущую калибровку: нормализация токенов,
+шинглы word-5 + char-17 по `content[:4000]`, `128` MinHash-перестановок,
+LSH `32` бэнда × `4` строки, подтверждение точным Jaccard-порогом (`0.7`).
+Пороги/шинглование/бэнды — без изменений от предыдущей реализации.
 
-Ранее (до 2026-07-03) эта же конфигурация использовала `64` перестановки и
-`16` бэндов по `4` строки; текущее значение — `128`/`32×4`.
+Реализация:
 
-#### Scenario: Near-duplicate news-документ выше порога
-- **WHEN** документ является LSH-кандидатом и точное сходство шинглов с уже
-  сохранённым документом ≥ `0.7`
-- **THEN** текущая raw-строка помечается в `source_metadata.preprocess` как
-  near-duplicate, `clean_items`-строка не создаётся, job закрывается как
-  `done`
+- MinHash-сигнатура вычисляется векторизованно (numpy broadcast `(128, N)`
+  + `min(axis=1)`) через схему хэш-миксинга `(x XOR mask_i) *
+  odd_multiplier_i` (натурально `uint64`-безопасная; предыдущая схема
+  `(a*x+b) mod (2⁶¹−1)` не векторизовалась из-за переполнения `uint64` при
+  `a*x`). Ориентир и факт: ~2 мс/док на реальном корпусе (было ~150 мс/док
+  вложенным Python-циклом).
+- Хэширование шинглов — `crc32` (не криптографический blake2b — MinHash не
+  требует криптостойкости; ~2.2x быстрее, решения дедупа не меняются:
+  максимальное расхождение Jaccard 0.0000 на 200 near-dup парах в замере).
+- Смена схемы хэш-миксинга влияет только на recall LSH-кандидатов, не на
+  итоговый accept/reject (точный Jaccard по множествам шинглов) — пороги
+  калибровки не затронуты.
+- LSH-индекс живёт в памяти воркера, восстанавливается из существующих
+  `clean_posts` на старте; БД используется только как источник для
+  восстановления кэша при рестарте, не для поиска кандидатов на каждый
+  документ. Шинглы кандидатов пересчитываются при band-коллизии, а не
+  кэшируются отдельно (экономия памяти).
+- Дубликат получает `is_duplicate=true`, `ID_canonical_post` → оригинал,
+  `dup_score`.
 
-#### Scenario: Near-dup фильтр не применяется к не-новостному документу
-- **WHEN** `document_type` документа не является новостным (news-like)
-- **THEN** MinHash near-dup фильтрация к нему не применяется, даже если
-  текст похож на уже сохранённый документ
+#### Scenario: Near-duplicate выше порога
+- **WHEN** документ является LSH-кандидатом и подтверждён порогом сходства
+  ≥ `0.7`
+- **THEN** строка `clean_posts` получает `is_duplicate=true`,
+  `ID_canonical_post` указывает на оригинал, `dup_score` заполнен
 
-### Requirement: Успешное создание clean_items
-Worker MUST, если документ проходит определение языка, junk-topic фильтр и
-оба уровня дедупа, записать одну строку в `agent_1.clean_items` и
-поставить в очередь одну job-строку `job_type='label_kr'`,
-`entity_type='clean_item'`, `entity_id=clean_items.id`, `status='pending'`.
+#### Scenario: Поиск кандидатов не ходит в БД на каждый документ
+- **WHEN** воркер обрабатывает пачку документов
+- **THEN** кандидаты ищутся во внутреннем LSH-индексе процесса,
+  построенном при старте воркера
+
+### Requirement: Производительность препроцессинга
+Реальная обработка (без учёта старта/загрузки кэша) MUST укладываться в
+≤25 мс/документ на одно ядро, с пропускной способностью ≥400k raw/час без
+эмбеддингов. Подтверждено на реальном бэкфилле 57k: **123 док/с (≈442
+800/час) на одном процессе** — multiprocessing не потребовался. Обязательные
+механики:
+
+1. Батчевый claim: anti-join `raw_posts` без соответствующей строки
+   `clean_posts`, `FOR UPDATE OF raw_posts SKIP LOCKED LIMIT 100`
+   (см. «Триггер preprocessing и claim job'ов»), обработка пачки в памяти,
+   запись результатов одной транзакцией (одна bulk-вставка в `clean_posts`,
+   two-phase: сначала kept-строки с `RETURNING id`, затем дубли по карте
+   `id_raw_post→id_clean_post` — решает self-FK `id_canonical_post`).
+   Per-document транзакции MUST NOT использоваться.
+2. cProfile-отчёт до/после (100+ документов, реальный корпус, не
+   синтетика — синтетический текст даёт нерепрезентативные цифры)
+   прикладывается к PR.
+
+Начальная загрузка dedup-кэша при старте воркера растёт с объёмом
+существующих `clean_posts` (известный follow-up, не блокирует целевую
+пропускную способность обработки: для разового bulk-бэкфилла старт
+происходит один раз).
+
+#### Scenario: Пачка обрабатывается одной транзакцией
+- **WHEN** воркер обработал claim-пачку из 100 документов
+- **THEN** результаты фиксируются одной транзакцией, а не 100 отдельными
+
+#### Scenario: Устойчивость к падению посреди батча
+- **WHEN** воркер упал после claim (raw-строки заблокированы `FOR UPDATE`),
+  но до commit
+- **THEN** транзакция откатывается, блокировки снимаются, строки
+  `clean_posts` не записаны — эти raw просто остаются без вердикта и
+  переклеймиваются следующим проходом (lease/timeout не нужен); дублей
+  строк не возникает благодаря `UNIQUE(id_raw_post)` на `clean_posts`
+
+### Requirement: Успешное создание clean_posts
+Worker MUST для документа, прошедшего язык, junk-фильтр и оба уровня
+дедупа, записать строку `clean_posts` с `clean_content`,
+`is_duplicate=false` и `drop_reason IS NULL` — такой документ становится
+кандидатом на эмбеддинг (`agent_1-embeddings`). Постановка LLM-задач
+MUST NOT производиться — downstream-чейнинг между агентами выполняет
+оркестратор (Агент 6).
 
 #### Scenario: Документ проходит preprocessing без отклонений
-- **WHEN** документ — русскоязычный, не подпадает под junk-topic фильтр, не
-  является ни exact-, ни near-duplicate
-- **THEN** создаётся строка `clean_items`, и для неё ставится в очередь
-  ровно один `label_kr` job
+- **WHEN** документ русскоязычный, не junk и не дубликат
+- **THEN** создаётся чистая строка `clean_posts`, и никакие LLM-job'ы
+  Агентом 1 не ставятся
 
 ### Requirement: Сохранение raw-строки при любом исходе
-Preprocessing MUST всегда сохранять исходную `raw_items`-строку независимо
-от исхода (создан `clean_items` или нет); решение дедупа/фильтрации
-записывается в `raw_items.source_metadata.preprocess`, а не приводит к
-удалению или изменению самой raw-строки.
+Preprocessing MUST никогда не удалять и не изменять строки `raw_posts`;
+вердикт очистки записывается в `clean_posts` (см. «Схема clean_posts и
+вердикт очистки»), а не в metadata raw-строки.
 
 #### Scenario: Документ отфильтрован любой причиной
-- **WHEN** документ отфильтрован как дубликат, non_russian_text или
-  junk_topic_regex
-- **THEN** соответствующая строка `raw_items` остаётся в БД без изменений
-  содержимого, только с добавленным `source_metadata.preprocess`
+- **WHEN** документ отфильтрован как дубликат, non_russian или junk
+- **THEN** строка `raw_posts` остаётся без изменений, вердикт живёт в
+  `clean_posts`
