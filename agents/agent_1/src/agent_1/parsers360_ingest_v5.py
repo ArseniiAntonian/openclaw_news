@@ -41,6 +41,7 @@ changes, for the v5 schema:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -137,18 +138,31 @@ def insert_raw_post(
     return "inserted"
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="v5 Parsers360 ingestion")
+    ap.add_argument(
+        "--max-items", type=int, default=None,
+        help="stop after this many items are fetched from the vendor "
+             "(counts everything seen, not just inserted) -- a safety cap "
+             "for manual/verification runs, not used by default",
+    )
+    return ap.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     start_at = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
     log_line(
         "INFO",
         f"Starting v5 ingest start_at={start_at} limit={v1.LIMIT} "
-        f"api_url={v1.API_URL} (target schema: {SCHEMA})",
+        f"max_items={args.max_items} api_url={v1.API_URL} (target schema: {SCHEMA})",
     )
 
     conn = psycopg.connect(DB_DSN, autocommit=False)
     source_cache: dict[str, int] = {}
     counts = {"inserted": 0, "no_url": 0, "no_content": 0, "no_time_post": 0}
+    seen = 0
     page = 1
 
     try:
@@ -162,15 +176,19 @@ def main() -> int:
                 for item in items:
                     result = insert_raw_post(cur, item, source_cache)
                     counts[result] = counts.get(result, 0) + 1
+                    seen += 1
 
                 conn.commit()
-                log_line("INFO", f"page={page} received={len(items)} counts={counts}")
+                log_line("INFO", f"page={page} received={len(items)} seen={seen} counts={counts}")
 
+                if args.max_items is not None and seen >= args.max_items:
+                    log_line("INFO", f"Reached max_items={args.max_items}, stopping before next page.")
+                    break
                 if len(items) < v1.LIMIT:
                     break
                 page += 1
 
-        log_line("INFO", f"done, counts={counts}, sources_resolved={len(source_cache)}")
+        log_line("INFO", f"done, seen={seen}, counts={counts}, sources_resolved={len(source_cache)}")
     except Exception as exc:
         conn.rollback()
         log_line("ERROR", f"v5 ingest failed: {exc}", stderr=True)
