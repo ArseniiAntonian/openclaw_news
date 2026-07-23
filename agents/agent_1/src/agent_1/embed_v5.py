@@ -165,6 +165,7 @@ def run(
     batch_size: int,
     max_input_chars: int,
     once: bool,
+    drain: bool,
     poll_interval: float,
     max_docs: int | None,
     log,
@@ -174,7 +175,10 @@ def run(
         batch = claim_batch(conn, batch_size)
         if not batch:
             conn.rollback()
-            if once:
+            # --drain exits when there's nothing left to embed (bulk run: keep
+            # going until the corpus is caught up, then stop). --once exits
+            # after a single batch. Otherwise poll for new work forever.
+            if once or drain:
                 break
             time.sleep(poll_interval)
             continue
@@ -202,6 +206,8 @@ def run(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="v5 embedding worker (OpenRouter)")
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--drain", action="store_true",
+                    help="embed until nothing left to embed, then exit (bulk-run mode)")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     ap.add_argument("--max-input-chars", type=int, default=DEFAULT_MAX_INPUT_CHARS)
     ap.add_argument("--poll-interval", type=float, default=5.0)
@@ -227,12 +233,16 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = psycopg.connect(DB_DSN, autocommit=False)
     try:
-        log(f"Starting v5 embed worker model={model} dims={EMBED_DIMS} batch={args.batch_size}")
+        log(
+            f"Starting v5 embed worker model={model} dims={EMBED_DIMS} "
+            f"batch={args.batch_size} once={args.once} drain={args.drain}"
+        )
         return run(
             conn, embed_fn,
             batch_size=args.batch_size,
             max_input_chars=args.max_input_chars,
             once=args.once,
+            drain=args.drain,
             poll_interval=args.poll_interval,
             max_docs=args.max_docs,
             log=log,
