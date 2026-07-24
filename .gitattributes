@@ -1,0 +1,7 @@
+# Normalize line endings: everything checked in as LF, checked out as-is.
+# Fixes the "LF will be replaced by CRLF" warnings on Windows checkouts.
+* text=auto eol=lf
+
+# Binary files: no line-ending normalization, no text diffing.
+*.png binary
+*.xlsx binary
