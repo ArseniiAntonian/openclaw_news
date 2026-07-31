@@ -139,18 +139,40 @@ def load_dotenv(path: Path) -> None:
             os.environ[key] = value.strip().strip('"').strip("'")
 
 
-def load_truth(path: Path, min_positives: int) -> tuple[dict[int, set[int]], int]:
-    """object_id -> множество размеченных положительных id_clean_post."""
+def load_truth(path: Path, min_positives: int) -> tuple[dict[int, set[int]], set[int]]:
+    """object_id -> положительные id, плюс множество ВСЕХ размеченных id.
+
+    Второе нужно, чтобы отличать «документ размечен и к объекту не
+    относится» от «документ вообще не размечен». Первое -- честная ошибка
+    метода, второе -- неизвестность, и смешивать их нельзя.
+    """
     truth: dict[int, set[int]] = {}
-    total = 0
+    labelled: set[int] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
-        total += 1
+        doc_id = int(row["id_clean_post"])
+        labelled.add(doc_id)
         for object_id in row.get("label_objects") or []:
-            truth.setdefault(int(object_id), set()).add(int(row["id_clean_post"]))
-    return {k: v for k, v in truth.items() if len(v) >= min_positives}, total
+            truth.setdefault(int(object_id), set()).add(doc_id)
+    return {k: v for k, v in truth.items() if len(v) >= min_positives}, labelled
+
+
+def fetch_titles(conn, ids: set[int]) -> dict[int, str]:
+    if not ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT c.id_clean_post, coalesce(r.title, '')
+            FROM {SCHEMA}.clean_posts c
+            JOIN {SCHEMA}.raw_posts r ON r.id_raw_post = c.id_raw_post
+            WHERE c.id_clean_post = ANY(%s)
+            """,
+            (list(ids),),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
 
 
 def regex_hits(conn, pattern: str, negative: str | None) -> set[int]:
@@ -200,6 +222,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-positives", type=int, default=5,
                     help="объекты с меньшим числом положительных не мерим -- шум")
     ap.add_argument("--ks", type=int, nargs="+", default=list(DEFAULT_KS))
+    ap.add_argument("--examples", type=int, default=5,
+                    help="сколько заголовков показывать в каждой категории примеров")
     args = ap.parse_args(argv)
 
     load_dotenv(args.env_file)
@@ -217,10 +241,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.labels.is_file():
         print(f"ERROR: не найден {args.labels}", file=sys.stderr)
         return 1
-    truth, labelled_total = load_truth(args.labels, args.min_positives)
+    truth, labelled_ids = load_truth(args.labels, args.min_positives)
     if not truth:
         print("Эталон пуст или во всех объектах слишком мало положительных.", file=sys.stderr)
         return 1
+    labelled_total = len(labelled_ids)
 
     by_id = {p.object_id: p for p in OBJECT_PATTERNS}
     max_k = max(args.ks)
@@ -282,12 +307,42 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
             )[0]
             union_k = min(max_k, 100)
-            union = regex_set | set(vector_hits(conn, embed_v5.vector_literal(vector_best), union_k))
+            ranked_best = vector_hits(conn, embed_v5.vector_literal(vector_best), union_k)
+            union = regex_set | set(ranked_best)
             value = recall(union, positives)
             row["methods"][f"regex ∪ vector:{best_form}@{union_k}"] = {
                 "recall": value, "returned": len(union)}
             print(f"    объединение      recall {value:5.1%}   "
                   f"(регекс ∪ vector:{best_form}@{union_k}, поднято {len(union)})")
+
+            # --- примеры: числа без заголовков не интерпретируются ---
+            vector_only = (positives & set(ranked_best)) - regex_set
+            missed_all = positives - regex_set - set(ranked_best)
+            # Ложные срабатывания регекса считаем ТОЛЬКО по размеченным
+            # документам: поднятый, но неразмеченный документ -- это
+            # неизвестность, а не ошибка.
+            regex_false = (regex_set & labelled_ids) - positives
+
+            titles = fetch_titles(conn, vector_only | missed_all | regex_false)
+            buckets = (
+                ("вектор нашёл, ключевые слова пропустили", vector_only,
+                 "ради этого затевался эксперимент"),
+                ("не нашёл никто", missed_all,
+                 "потолок обоих методов на этом корпусе"),
+                ("ключевые слова подняли ошибочно", regex_false,
+                 "только среди размеченных; неразмеченные не в счёт"),
+            )
+            row["examples"] = {}
+            for name, ids, note in buckets:
+                row["examples"][name] = {
+                    "count": len(ids),
+                    "titles": [titles.get(i, "") for i in sorted(ids)[: args.examples]],
+                }
+                if not ids:
+                    continue
+                print(f"    · {name}: {len(ids)}  ({note})")
+                for doc_id in sorted(ids)[: args.examples]:
+                    print(f"        {titles.get(doc_id, '')[:92]}")
             print()
 
             report["objects"][str(object_id)] = row
