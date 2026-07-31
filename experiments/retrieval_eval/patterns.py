@@ -220,13 +220,26 @@ OBJECT_PATTERNS: tuple[ObjectPattern, ...] = (
 # Неоднозначность `кандинск` идёт в отчёт как отдельная находка.
 # ---------------------------------------------------------------------------
 
+# Отбирались по одному признаку: строка не имеет распространённого значения
+# вне темы ИИ. Поэтому здесь нет `llama` (животное), `mistral` (ветер),
+# `кандинск` (художник), `nvidia` (игровое железо) -- на них контроль
+# ложно срабатывал бы ровно так же, как сломался в первый раз.
 CONTROL_PATTERNS: tuple[ObjectPattern, ...] = (
     ObjectPattern(
-        key="ctl1",
-        label="GigaChat (однозначная подстрока)",
+        key="ctl1", label="GigaChat", object_id=1, approx=False,
         regex=r"gigachat|гигачат|giga\s?chat",
-        approx=False,
-        object_id=1,
+    ),
+    ObjectPattern(
+        key="ctl2", label="YandexGPT", object_id=2, approx=False,
+        regex=r"yandexgpt|яндексгпт|\byagpt\b",
+    ),
+    ObjectPattern(
+        key="ctl3", label="DeepSeek", object_id=3, approx=False,
+        regex=r"deepseek|дипсик",
+    ),
+    ObjectPattern(
+        key="ctl4", label="OpenAI / ChatGPT", object_id=4, approx=False,
+        regex=r"openai|chatgpt|чат-?гпт",
     ),
 )
 

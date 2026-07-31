@@ -31,10 +31,13 @@ recall ключевых слов окажется 100% по построению
 вручную не будет, поэтому доверие к меткам нужно чем-то обосновать. Две
 встроенные проверки:
 
-- *контроль по однозначной подстроке.* `CONTROL_PATTERNS` из `patterns.py`:
-  `gigachat|гигачат`, без `кандинск` -- каталожная альтернатива ловит
-  Василия Кандинского наравне с моделью Сбера, и построенный на ней
-  контроль давал ложную тревогу.
+- *контроль по однозначным брендовым подстрокам.* `CONTROL_PATTERNS` из
+  `patterns.py`: GigaChat, YandexGPT, DeepSeek, OpenAI/ChatGPT. Строки
+  подобраны так, чтобы вне темы ИИ они не встречались, поэтому их наличие
+  почти наверняка означает как минимум упоминание объекта. Каталожный
+  регекс для контроля не годится: его альтернатива `кандинск` ловит
+  Василия Кандинского наравне с моделью Сбера, и первый прогон получил
+  из-за этого ложную тревогу.
 - *самосогласованность.* Доля документов (`--recheck-frac`) размечается
   второй раз в отдельной сессии, другим порядком и в другой компоновке
   батча. Совпадение двух проходов -- верхняя оценка надёжности.
@@ -64,7 +67,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from patterns import OBJECT_PATTERNS  # noqa: E402
+from patterns import CONTROL_PATTERNS, OBJECT_PATTERNS  # noqa: E402
 
 DEFAULT_AGENT_ID = "agent_1"
 # Батч меньше, текста больше: модель обязана видеть примерно то же, что
@@ -348,20 +351,29 @@ def report(labelled: dict[int, dict[str, Any]], queue: list[dict[str, Any]],
     # именно упоминания, поэтому требовать от них событийной точности
     # некорректно. Прошлый прогон сравнивал только с событиями и потому
     # показывал провал там, где расхождения не было.
-    control = [i for i, d in by_id.items() if 1 in (d.get("control_objects") or []) and i in labelled]
-    if control:
+    print("\nКонтроль по однозначным брендовым подстрокам:")
+    control_total = control_agree = 0
+    for ctl in CONTROL_PATTERNS:
+        oid = ctl.object_id
+        docs = [i for i, d in by_id.items()
+                if oid in (d.get("control_objects") or []) and i in labelled]
+        if not docs:
+            print(f"  {ctl.label:<18} документов нет")
+            continue
         agree = sum(
-            1 for i in control
-            if 1 in set(labelled[i]["label_objects"]) | set(labelled[i].get("mention_objects") or [])
+            1 for i in docs
+            if oid in set(labelled[i]["label_objects"]) | set(labelled[i].get("mention_objects") or [])
         )
-        strict = sum(1 for i in control if 1 in labelled[i]["label_objects"])
-        print(f"\nКонтроль по объекту 1 (подстрока gigachat/гигачат, без «кандинск»):")
-        print(f"  подстрока найдена в {len(control)} документах")
-        print(f"  модель отметила объект хоть как-то: {agree}  ({agree * 100 // len(control)}%)")
-        print(f"  из них как событие:                 {strict}")
-        print("  первая цифра ниже ~80% => меткам верить нельзя")
-    else:
-        print("\nКонтроль невозможен: документов с подстрокой в очереди нет.")
+        strict = sum(1 for i in docs if oid in labelled[i]["label_objects"])
+        control_total += len(docs)
+        control_agree += agree
+        print(f"  {ctl.label:<18} найдено {len(docs):>4}   отмечено {agree:>4}"
+              f"  ({agree * 100 // len(docs):>3}%)   из них событием {strict:>4}")
+    if control_total:
+        share = control_agree * 100 // control_total
+        print(f"  ИТОГО              найдено {control_total:>4}   отмечено {control_agree:>4}"
+              f"  ({share:>3}%)")
+        print("  ниже ~80% => меткам верить нельзя, разметку надо переделывать")
 
     # --- проверка 2: самосогласованность на повторном проходе ---
     if recheck:
