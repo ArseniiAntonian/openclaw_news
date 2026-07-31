@@ -236,6 +236,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ks", type=int, nargs="+", default=list(DEFAULT_KS))
     ap.add_argument("--examples", type=int, default=5,
                     help="сколько заголовков показывать в каждой категории примеров")
+    ap.add_argument("--exclude-objects", type=int, nargs="*", default=[],
+                    help="не мерить эти объекты. Нужно для тех, где разметка "
+                         "заведомо испорчена: объект 9 после уточнения "
+                         "формулировки собрал 293 метки «только модель» против "
+                         "2 совпадений с каталогом, то есть стал означать "
+                         "«любая новость, где кто-то высказался об ИИ»")
     ap.add_argument("--relation", choices=("event", "any"), default="event",
                     help="что считать положительным: только события (по умолчанию) "
                          "или события вместе с упоминаниями -- второе ближе к тому, "
@@ -258,6 +264,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: не найден {args.labels}", file=sys.stderr)
         return 1
     truth, labelled_ids = load_truth(args.labels, args.min_positives, args.relation)
+    for object_id in args.exclude_objects:
+        if truth.pop(object_id, None) is not None:
+            print(f"Объект {object_id} исключён из замера (--exclude-objects)")
     if not truth:
         print("Эталон пуст или во всех объектах слишком мало положительных.", file=sys.stderr)
         return 1
