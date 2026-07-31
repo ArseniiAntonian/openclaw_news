@@ -213,9 +213,20 @@ def set_ef_search(conn, ef_search: int) -> None:
     выглядит как recall, замерший на одном значении при росте K, и как
     совпадающие результаты у разных запросов -- ровно то, что и вылезло на
     первом прогоне. ef_search обязан быть не меньше максимального K.
+
+    Через `set_config`, а не `SET`: `SET` принимает только литерал и падает
+    с `syntax error at or near "$1"` на подстановочном параметре. Значение
+    читается обратно и сверяется -- тихо не применившийся ef_search испортит
+    все числа замера, ничем себя не выдав.
     """
     with conn.cursor() as cur:
-        cur.execute("SET hnsw.ef_search = %s", (ef_search,))
+        cur.execute("SELECT set_config('hnsw.ef_search', %s, false)", (str(ef_search),))
+        cur.execute("SHOW hnsw.ef_search")
+        actual = cur.fetchone()[0]
+    if int(actual) != ef_search:
+        raise RuntimeError(
+            f"hnsw.ef_search не применился: запрошено {ef_search}, в сессии {actual}"
+        )
 
 
 def vector_hits(conn, vector_literal: str, limit: int) -> list[int]:
