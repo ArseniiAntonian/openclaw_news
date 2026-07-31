@@ -32,7 +32,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from patterns import OBJECT_PATTERNS  # noqa: E402
+from patterns import CONTROL_PATTERNS, OBJECT_PATTERNS  # noqa: E402
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -59,6 +59,38 @@ def main(argv: list[str] | None = None) -> int:
     queue = {d["id_clean_post"]: d for d in read_jsonl(args.queue)}
     labels = {d["id_clean_post"]: d for d in read_jsonl(args.labels)}
     print(f"Очередь: {len(queue)}   Размечено: {len(labels)}\n")
+
+    # Контроль качества меток. Считается здесь, а не только внутри
+    # разметчика, потому что состав CONTROL_PATTERNS может пополниться уже
+    # после того, как очередь собрана и разметка проведена: пересобрать
+    # очередь и пересчитать контроль стоит секунды, а повторная разметка --
+    # часы. Соединение идёт по id_clean_post, метки при этом не трогаются.
+    print("Контроль по однозначным брендовым подстрокам:")
+    total = agreed = 0
+    for ctl in CONTROL_PATTERNS:
+        oid = ctl.object_id
+        docs = [i for i, d in queue.items()
+                if oid in (d.get("control_objects") or []) and i in labels]
+        if not docs:
+            print(f"  {ctl.label:<18} документов нет "
+                  f"(очередь собрана без этого паттерна — пересобери triage_pool)")
+            continue
+        hit = sum(
+            1 for i in docs
+            if oid in set(labels[i].get("label_objects") or [])
+            | set(labels[i].get("mention_objects") or [])
+        )
+        strict = sum(1 for i in docs if oid in (labels[i].get("label_objects") or []))
+        total += len(docs)
+        agreed += hit
+        print(f"  {ctl.label:<18} найдено {len(docs):>4}   отмечено {hit:>4}"
+              f"  ({hit * 100 // len(docs):>3}%)   из них событием {strict:>4}")
+    if total:
+        print(f"  ИТОГО              найдено {total:>4}   отмечено {agreed:>4}"
+              f"  ({agreed * 100 // total:>3}%)")
+        print("  ниже ~80% => меткам верить нельзя\n")
+    else:
+        print()
 
     print(f"{'об':>3}  {'объект':<40} {'оба':>5} {'только':>7} {'только':>7}")
     print(f"{'':>3}  {'':<40} {'':>5} {'модель':>7} {'регекс':>7}")
