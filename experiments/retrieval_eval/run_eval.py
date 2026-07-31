@@ -139,11 +139,20 @@ def load_dotenv(path: Path) -> None:
             os.environ[key] = value.strip().strip('"').strip("'")
 
 
-def load_truth(path: Path, min_positives: int) -> tuple[dict[int, set[int]], set[int]]:
+def load_truth(path: Path, min_positives: int, relation: str
+               ) -> tuple[dict[int, set[int]], set[int]]:
     """object_id -> положительные id, плюс множество ВСЕХ размеченных id.
 
-    Второе нужно, чтобы отличать «документ размечен и к объекту не
-    относится» от «документ вообще не размечен». Первое -- честная ошибка
+    `relation` выбирает определение положительного:
+      "event"  -- только события (новость про объект по существу);
+      "any"    -- события и упоминания вместе, то есть то, на что нацелены
+                  ключевые слова каталога банка.
+
+    Разметка хранит оба уровня, поэтому смена определения не требует
+    повторного прогона модели.
+
+    Множество всех размеченных нужно, чтобы отличать «документ размечен и к
+    объекту не относится» от «документ вообще не размечен». Первое -- ошибка
     метода, второе -- неизвестность, и смешивать их нельзя.
     """
     truth: dict[int, set[int]] = {}
@@ -154,7 +163,10 @@ def load_truth(path: Path, min_positives: int) -> tuple[dict[int, set[int]], set
         row = json.loads(line)
         doc_id = int(row["id_clean_post"])
         labelled.add(doc_id)
-        for object_id in row.get("label_objects") or []:
+        ids = list(row.get("label_objects") or [])
+        if relation == "any":
+            ids += list(row.get("mention_objects") or [])
+        for object_id in ids:
             truth.setdefault(int(object_id), set()).add(doc_id)
     return {k: v for k, v in truth.items() if len(v) >= min_positives}, labelled
 
@@ -224,6 +236,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ks", type=int, nargs="+", default=list(DEFAULT_KS))
     ap.add_argument("--examples", type=int, default=5,
                     help="сколько заголовков показывать в каждой категории примеров")
+    ap.add_argument("--relation", choices=("event", "any"), default="event",
+                    help="что считать положительным: только события (по умолчанию) "
+                         "или события вместе с упоминаниями -- второе ближе к тому, "
+                         "на что нацелены ключевые слова каталога")
     args = ap.parse_args(argv)
 
     load_dotenv(args.env_file)
@@ -241,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.labels.is_file():
         print(f"ERROR: не найден {args.labels}", file=sys.stderr)
         return 1
-    truth, labelled_ids = load_truth(args.labels, args.min_positives)
+    truth, labelled_ids = load_truth(args.labels, args.min_positives, args.relation)
     if not truth:
         print("Эталон пуст или во всех объектах слишком мало положительных.", file=sys.stderr)
         return 1
@@ -251,8 +267,11 @@ def main(argv: list[str] | None = None) -> int:
     max_k = max(args.ks)
     report: dict[str, Any] = {"labelled_total": labelled_total, "objects": {}}
 
+    relation_note = ("только события" if args.relation == "event"
+                     else "события и упоминания вместе")
     print(f"\nЭталон: {labelled_total} размеченных документов, "
-          f"объектов к замеру: {len(truth)} (порог {args.min_positives} положительных)\n")
+          f"объектов к замеру: {len(truth)} (порог {args.min_positives} положительных)")
+    print(f"Положительным считается: {relation_note} (--relation {args.relation})\n")
     print("Precision не считается намеренно: релевантность документов вне "
           "размеченной очереди неизвестна.")
     print("Смещение эталона -- в пользу регекса (см. шапку файла): его "

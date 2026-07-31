@@ -46,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sample", type=int, default=8, help="сколько заголовков показать в примерах")
     ap.add_argument("--object", type=int, default=None,
                     help="показать заголовки всех трёх категорий по одному объекту")
+    ap.add_argument("--strict", action="store_true",
+                    help="считать за метку только «событие». По умолчанию учитываются "
+                         "и упоминания -- именно их ловят ключевые слова каталога")
     args = ap.parse_args(argv)
 
     for path in (args.queue, args.labels):
@@ -70,7 +73,12 @@ def main(argv: list[str] | None = None) -> int:
             label_row = labels.get(doc_id)
             if label_row is None:
                 continue  # ещё не размечено
-            by_model = oid in (label_row.get("label_objects") or [])
+            # Регекс каталога ловит упоминания, поэтому сравнивать его надо
+            # с суммой «событие + упоминание», иначе расхождение считается
+            # там, где методы просто отвечают на разные вопросы.
+            by_model = oid in (label_row.get("label_objects") or []) or (
+                not args.strict and oid in (label_row.get("mention_objects") or [])
+            )
             by_regex = oid in (doc.get("matched_objects") or [])
             if by_model and by_regex:
                 both += 1
@@ -85,8 +93,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{oid:>3}  {pattern.label[:40]:<40} {both:>5} {model_only:>7} {regex_only:>7}{mark}")
 
         if oid == 1 and (model_only or regex_only):
-            print("       ^ регекс объекта 1 известен дословно: расхождение здесь")
-            print("         читается как ошибка модели, а не реконструкции")
+            print("       ^ регекс объекта 1 известен дословно, но НЕ точен: альтернатива")
+            print("         «кандинск» ловит художника наравне с моделью Сбера, поэтому")
+            print("         «только регекс» здесь -- в том числе ложные срабатывания")
 
     print("\n* -- регекс реконструирован по алиасам, оригинал в документации обрезан.")
     print("«только модель» у таких объектов = узость нашей реконструкции + перелейблинг модели,")
@@ -107,7 +116,9 @@ def main(argv: list[str] | None = None) -> int:
             row = labels.get(doc_id)
             if row is None:
                 continue
-            by_model = args.object in (row.get("label_objects") or [])
+            by_model = args.object in (row.get("label_objects") or []) or (
+                not args.strict and args.object in (row.get("mention_objects") or [])
+            )
             by_regex = args.object in (doc.get("matched_objects") or [])
             if by_model and by_regex:
                 groups["оба"].append(doc_id)

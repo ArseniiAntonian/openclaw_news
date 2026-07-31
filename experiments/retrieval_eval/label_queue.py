@@ -19,13 +19,22 @@ recall ключевых слов окажется 100% по построению
 ради ухода от которой пул набирался широким неводом. Поле используется
 только как контроль после разметки, никогда как вход.
 
-**2. Качество меряется без участия человека.** Пользователь размечать
+**2. Разметка двухуровневая: «событие» и «упоминание».** Одного бита
+«относится / не относится» недостаточно, потому что методы отвечают на
+разные вопросы: ключевые слова каталога банка ловят *упоминания*
+(«выражения включения новости в выборку объекта»), а пайплайну на выходе
+нужны *события* (драйверы). Разметив оба уровня за один проход, recall
+считается под любое из двух определений без повторного прогона -- а
+контроль сравнивается с суммой, как и положено ключевым словам.
+
+**3. Качество меряется без участия человека.** Пользователь размечать
 вручную не будет, поэтому доверие к меткам нужно чем-то обосновать. Две
 встроенные проверки:
 
-- *контроль по объекту 1.* Регекс GigaChat -- единственный, известный
-  дословно (остальные реконструированы). Документы, где он сработал, почти
-  наверняка про GigaChat. Если модель их не отмечает, меткам верить нельзя.
+- *контроль по однозначной подстроке.* `CONTROL_PATTERNS` из `patterns.py`:
+  `gigachat|гигачат`, без `кандинск` -- каталожная альтернатива ловит
+  Василия Кандинского наравне с моделью Сбера, и построенный на ней
+  контроль давал ложную тревогу.
 - *самосогласованность.* Доля документов (`--recheck-frac`) размечается
   второй раз в отдельной сессии, другим порядком и в другой компоновке
   батча. Совпадение двух проходов -- верхняя оценка надёжности.
@@ -58,24 +67,56 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from patterns import OBJECT_PATTERNS  # noqa: E402
 
 DEFAULT_AGENT_ID = "agent_1"
-DEFAULT_BATCH = 10
-DEFAULT_TIMEOUT = 600
-DEFAULT_TEXT_CHARS = 700
+# Батч меньше, текста больше: модель обязана видеть примерно то же, что
+# видит регекс (до 6000 знаков). В первом прогоне было 700 знаков против
+# 6000 у регекса -- методы сравнивались на разных входных данных, и весь
+# замер оказался испорчен. Это была ошибка постановки, а не модели.
+DEFAULT_BATCH = 5
+DEFAULT_TIMEOUT = 900
+DEFAULT_TEXT_CHARS = 4000
 
 # Каталог для промпта: имя + алиасы из observation_objects_context.md.
 # Это материал промпта, а не механика матчинга, поэтому живёт здесь, а не в
 # patterns.py -- модель читает описания, регексы её не касаются.
+# Границы объектов заданы явно, через «не относится». Формулировки взяты не
+# с потолка: это разбор перелейблинга первого прогона, где объект 8 собрал
+# 234 лишние метки («CEO Циан о рынке ипотеки», «микрофонный массив с
+# ИИ-обработкой»), объект 10 -- 202, объект 5 -- 133. Расплывчатое название
+# категории притягивает всё подряд, пока не сказано, что в неё НЕ входит.
 CATALOG: dict[int, str] = {
-    1: "GigaChat — нейросеть Сбера. Алиасы: ГигаЧат, Гигачад, гига, Кандинский, Kandinsky.",
-    2: "YandexGPT / Алиса — ИИ-продукты Яндекса. Алиасы: ЯндексГПТ, YaGPT, Алиса AI, Яндекс Нейро, Yandex Cloud ML.",
-    3: "Open-source модели для self-hosting — открытые модели, которые можно развернуть у себя. DeepSeek, Qwen, Llama, Mistral.",
-    4: "OpenAI / ChatGPT — глобальные лидеры генеративного ИИ. Также GPT-4/5, Sora, Anthropic, Claude.",
-    5: "Доверие к ИИ / общественное восприятие — отношение людей к ИИ: доверие, страх, скепсис, хайп, недовольство ИИ-продуктами.",
-    6: "Регуляторика ИИ — законы, маркировка ИИ-контента, персональные данные, госрегулирование, AI Act, инициативы Госдумы.",
-    7: "GPU и вычислительные мощности — видеокарты, чипы, память для ИИ, дата-центры под ИИ, Nvidia, дефицит железа.",
-    8: "Корпоративное внедрение GenAI — применение ИИ в бизнесе и на производстве, enterprise AI, цифровая трансформация.",
-    9: "Лидеры мнений в теме ИИ — эксперты, евангелисты, ИИ-блогеры; публичные высказывания и прогнозы о нейросетях.",
-    10: "Инциденты и безопасность GenAI — утечки, галлюцинации, дипфейки, мошенничество с ИИ, сбои и запреты нейросетей.",
+    1: "GigaChat — генеративная нейросеть Сбера (ГигаЧат, Гигачад) и Кандинский/Kandinsky "
+       "для генерации изображений.\n"
+       "     НЕ относится: художник Василий Кандинский, выставки живописи.",
+    2: "YandexGPT / Алиса — ИИ-продукты Яндекса: YandexGPT, YaGPT, Алиса AI, Яндекс Нейро, "
+       "Yandex Cloud ML.\n"
+       "     НЕ относится: Алиса Селезнёва, другие тёзки.",
+    3: "Open-source модели для self-hosting — открытые модели, разворачиваемые у себя: "
+       "DeepSeek, Qwen, Llama, Mistral; их релизы, лицензии, сравнения.\n"
+       "     НЕ относится: закрытые облачные модели.",
+    4: "OpenAI / ChatGPT — глобальные лидеры генеративного ИИ: OpenAI, ChatGPT, GPT-4/5, "
+       "Sora, Anthropic, Claude; их релизы, иски, ограничения доступа.",
+    5: "Доверие к ИИ / общественное восприятие — отношение ЛЮДЕЙ к ИИ: опросы, страхи, "
+       "скепсис, протест, отказ пользоваться, недовольство ИИ-продуктами.\n"
+       "     НЕ относится: обычная новость о выходе или возможностях ИИ-продукта; "
+       "рассуждения о влиянии ИИ на экономику.",
+    6: "Регуляторика ИИ — конкретные регуляторные действия: законопроекты и законы об ИИ, "
+       "обязательная маркировка ИИ-контента, требования к персональным данным, "
+       "стандарты, запреты, решения регуляторов.\n"
+       "     НЕ относится: чьё-то мнение о том, что ИИ надо бы регулировать.",
+    7: "GPU и вычислительные мощности — железо и инфраструктура под ИИ: ускорители и "
+       "ИИ-чипы, память, серверы, дата-центры для ИИ-нагрузки, дефицит и поставки.\n"
+       "     НЕ относится: видеокарты для игр, майнинг, котировки Nvidia.",
+    8: "Корпоративное внедрение GenAI — конкретная компания, отрасль или ведомство "
+       "ВНЕДРЯЕТ генеративный ИИ у себя, либо измеримые последствия такого внедрения.\n"
+       "     НЕ относится: вендор выпустил ИИ-продукт или добавил ИИ-функцию в устройство; "
+       "общие рассуждения об экономике и рынке труда; новость про бизнес, где ИИ помянут "
+       "вскользь.",
+    9: "Лидеры мнений в теме ИИ — НАЗВАННЫЙ человек публично высказывается об ИИ: "
+       "эксперт, руководитель, евангелист, ИИ-блогер; его прогноз или оценка.\n"
+       "     НЕ относится: позиция компании или ведомства без конкретного спикера.",
+    10: "Инциденты и безопасность GenAI — произошедшее событие: утечка, дипфейк, "
+        "мошенничество с ИИ, галлюцинация с последствиями, сбой, блокировка модели.\n"
+        "     НЕ относится: общие рассуждения о рисках ИИ, если инцидента не было.",
 }
 
 PROMPT_HEAD = """Ты размечаешь новости для системы мониторинга.
@@ -84,21 +125,30 @@ PROMPT_HEAD = """Ты размечаешь новости для системы 
 
 {catalog}
 
-Ниже {n} новостей. Для каждой определи, к каким объектам каталога она
-относится по существу.
+Ниже {n} новостей. Для каждой новости и каждого объекта определи отношение,
+различая ДВА разных уровня:
+
+- "событие" — новость сообщает о событии, которое касается этого объекта.
+  Объект в центре сюжета или прямо им затронут.
+- "упоминание" — объект назван или задет в тексте, но новость про другое.
+  Например, он в перечислении, в сравнении, в фоновой справке.
+- ничего — объект в новости не фигурирует.
+
+Различать их важно: это два разных вопроса, и ответы на них используются
+по-разному. Не сваливай упоминания в события и наоборот.
 
 Правила:
-- Относится = новость сообщает о событии, которое касается этого объекта.
-  Проходное упоминание в тексте про другое — НЕ относится.
-- Объектов может быть несколько, может не быть ни одного (пустой список).
-- Не угадывай по одному лишь наличию слова: важно, о чём новость.
-- Если новость про ИИ вообще, но ни под один объект не подходит — пустой список.
+- Читай раздел «НЕ относится» у объекта: он задаёт границу категории.
+- Объектов может быть несколько, может не быть ни одного.
+- Наличие слова само по себе ничего не решает — важно, о чём новость.
+- Текст новости может быть обрезан. Суди по тому, что видишь; если данных
+  не хватает для решения, ставь confidence "low".
 
 Верни СТРОГО JSON, без пояснений и без markdown-обёртки:
 
-{{"labels": [{{"id": <id новости>, "objects": [<номера>], "confidence": "high"|"low"}}]}}
+{{"labels": [{{"id": <id новости>, "events": [<номера>], "mentions": [<номера>], "confidence": "high"|"low"}}]}}
 
-confidence = "low", если сомневаешься или текста мало для решения.
+Объект не должен попадать одновременно в events и mentions.
 Ответь по всем {n} новостям, ничего не пропуская.
 
 Новости:
@@ -182,13 +232,16 @@ def build_prompt(batch: list[dict[str, Any]], text_chars: int) -> str:
     head = PROMPT_HEAD.format(catalog=catalog, n=len(batch))
     blocks = []
     for doc in batch:
-        # ВНИМАНИЕ: matched_objects сюда не попадает намеренно (см. шапку).
+        # ВНИМАНИЕ: matched_objects и control_objects сюда не попадают
+        # намеренно (см. шапку) -- иначе модель спишет ответ у регекса.
         parts = [f"--- id: {doc['id_clean_post']}", f"Заголовок: {doc.get('title') or ''}"]
         if doc.get("summary"):
             parts.append(f"Аннотация: {doc['summary']}")
         body = (doc.get("text_head") or "")[:text_chars]
         if body:
             parts.append(f"Текст: {body}")
+            if len(doc.get("text_head") or "") > text_chars or doc.get("text_truncated_for_prompt"):
+                parts.append("(текст обрезан)")
         blocks.append("\n".join(parts))
     return head + "\n\n".join(blocks)
 
@@ -233,15 +286,23 @@ def label_batch(batch: list[dict[str, Any]], *, session_key: str, args: argparse
 
     valid_ids = {d["id_clean_post"] for d in batch}
     out: dict[int, dict[str, Any]] = {}
+
+    def clean(values: Any) -> set[int]:
+        return {o for o in (values or []) if isinstance(o, int) and o in CATALOG}
+
     for row in rows:
         if not isinstance(row, dict):
             continue
         doc_id = row.get("id")
         if doc_id not in valid_ids:
             continue  # модель выдумала id -- молча не принимаем
-        objects = [o for o in (row.get("objects") or []) if isinstance(o, int) and o in CATALOG]
+        events = clean(row.get("events"))
+        # Событие сильнее упоминания: если модель поставила объект в оба
+        # списка вопреки инструкции, оставляем его событием.
+        mentions = clean(row.get("mentions")) - events
         out[doc_id] = {
-            "label_objects": sorted(set(objects)),
+            "label_objects": sorted(events),
+            "mention_objects": sorted(mentions),
             "confidence": row.get("confidence") if row.get("confidence") in ("high", "low") else None,
         }
     return out
@@ -260,58 +321,89 @@ def report(labelled: dict[int, dict[str, Any]], queue: list[dict[str, Any]],
     if not total:
         return
 
-    counter: Counter[int] = Counter()
+    events_counter: Counter[int] = Counter()
+    mentions_counter: Counter[int] = Counter()
     empty = 0
     low = 0
-    for doc_id, row in labelled.items():
-        objs = row["label_objects"]
-        counter.update(objs)
-        if not objs:
+    for row in labelled.values():
+        events_counter.update(row["label_objects"])
+        mentions_counter.update(row.get("mention_objects") or [])
+        if not row["label_objects"] and not (row.get("mention_objects") or []):
             empty += 1
         if row.get("confidence") == "low":
             low += 1
 
-    print("Размечено по объектам:")
+    print(f"{'об':>3}  {'объект':<42} {'событие':>8} {'упомин.':>8}")
     for pattern in OBJECT_PATTERNS:
-        mark = " (approx-регекс)" if pattern.approx else ""
-        print(f"  {pattern.object_id:>2}  {pattern.label[:44]:<44} {counter.get(pattern.object_id, 0):>5}{mark}")
-    print(f"\nБез объектов (мусор/не по теме): {empty}  ({empty * 100 // total}%)")
-    print(f"Помечено моделью как неуверенные:  {low}  ({low * 100 // total}%)")
+        mark = " *" if pattern.approx else ""
+        print(f"  {pattern.object_id:>2}  {pattern.label[:42]:<42} "
+              f"{events_counter.get(pattern.object_id, 0):>8} "
+              f"{mentions_counter.get(pattern.object_id, 0):>8}{mark}")
+    print("  * -- регекс каталога реконструирован")
+    print(f"\nНи одного объекта вообще:         {empty}  ({empty * 100 // total}%)")
+    print(f"Помечено моделью как неуверенные: {low}  ({low * 100 // total}%)")
 
-    # --- проверка 1: контроль по объекту 1 (единственный точный регекс) ---
-    control = [i for i, d in by_id.items() if 1 in (d.get("matched_objects") or []) and i in labelled]
+    # --- проверка 1: контроль по однозначной подстроке ---
+    # Сравнивается с суммой «событие + упоминание»: ключевые слова ловят
+    # именно упоминания, поэтому требовать от них событийной точности
+    # некорректно. Прошлый прогон сравнивал только с событиями и потому
+    # показывал провал там, где расхождения не было.
+    control = [i for i, d in by_id.items() if 1 in (d.get("control_objects") or []) and i in labelled]
     if control:
-        agree = sum(1 for i in control if 1 in labelled[i]["label_objects"])
-        print(f"\nКонтроль по объекту 1 (GigaChat, регекс известен дословно):")
-        print(f"  регекс сработал на {len(control)}, модель подтвердила {agree}"
-              f"  ({agree * 100 // len(control)}%)")
-        print("  низкий процент => меткам верить нельзя, разметку надо переделывать")
+        agree = sum(
+            1 for i in control
+            if 1 in set(labelled[i]["label_objects"]) | set(labelled[i].get("mention_objects") or [])
+        )
+        strict = sum(1 for i in control if 1 in labelled[i]["label_objects"])
+        print(f"\nКонтроль по объекту 1 (подстрока gigachat/гигачат, без «кандинск»):")
+        print(f"  подстрока найдена в {len(control)} документах")
+        print(f"  модель отметила объект хоть как-то: {agree}  ({agree * 100 // len(control)}%)")
+        print(f"  из них как событие:                 {strict}")
+        print("  первая цифра ниже ~80% => меткам верить нельзя")
     else:
-        print("\nКонтроль по объекту 1 невозможен: таких документов в очереди нет.")
+        print("\nКонтроль невозможен: документов с подстрокой в очереди нет.")
 
     # --- проверка 2: самосогласованность на повторном проходе ---
     if recheck:
-        same = sum(1 for i, objs in recheck.items()
-                   if i in labelled and sorted(objs) == labelled[i]["label_objects"])
-        print(f"\nСамосогласованность (повторная разметка вслепую):")
-        print(f"  перепроверено {len(recheck)}, совпало точно {same}"
+        same = sum(
+            1 for i, pair in recheck.items()
+            if i in labelled
+            and pair[0] == labelled[i]["label_objects"]
+            and pair[1] == (labelled[i].get("mention_objects") or [])
+        )
+        loose = sum(
+            1 for i, pair in recheck.items()
+            if i in labelled
+            and set(pair[0]) | set(pair[1])
+            == set(labelled[i]["label_objects"]) | set(labelled[i].get("mention_objects") or [])
+        )
+        print(f"\nСамосогласованность (повторная разметка вслепую), {len(recheck)} документов:")
+        print(f"  совпало точно (события и упоминания):        {same}"
               f"  ({same * 100 // len(recheck)}%)")
-        print("  <70% => модель шумит, эталон стоит сузить до confidence=high")
+        print(f"  совпал состав объектов без учёта градации:   {loose}"
+              f"  ({loose * 100 // len(recheck)}%)")
+        print("  вторая цифра <80% => модель шумит в самом наборе объектов")
     else:
         print("\nПовторный проход не запускался (--recheck-frac 0).")
 
-    # Ключевая цифра для эксперимента: сколько размеченных положительных
-    # регекс каталога НЕ поймал. Это и есть пропуски ключевых слов.
-    misses = sum(
-        1 for i, row in labelled.items()
-        if row["label_objects"] and not set(row["label_objects"]) & set(by_id[i].get("matched_objects") or [])
-    )
-    positives = sum(1 for row in labelled.values() if row["label_objects"])
-    if positives:
-        print(f"\nРазмеченных положительных: {positives}")
-        print(f"  из них регекс каталога не поймал ни одного их объекта: {misses}"
-              f"  ({misses * 100 // positives}%)")
-        print("  это верхняя оценка recall-потерь ключевых слов -- ради неё всё и делалось")
+    # Пропуски ключевых слов, по-объектно. Прошлая версия считала на уровне
+    # документа («ни один из его объектов не пойман») и потому занижала:
+    # документ с метками 4 и 8, где регекс поймал только 4, пропуском не
+    # считался, хотя ключевые слова объекта 8 его упустили.
+    print("\nПропуски ключевых слов по объектам (событийные метки):")
+    print(f"{'об':>3}  {'объект':<42} {'событий':>8} {'пропущ.':>8}")
+    for pattern in OBJECT_PATTERNS:
+        oid = pattern.object_id
+        positives = [i for i, row in labelled.items() if oid in row["label_objects"]]
+        if not positives:
+            continue
+        missed = sum(1 for i in positives if oid not in (by_id[i].get("matched_objects") or []))
+        share = f"{missed * 100 // len(positives)}%"
+        mark = " *" if pattern.approx else ""
+        print(f"  {oid:>2}  {pattern.label[:42]:<42} {len(positives):>8} "
+              f"{missed:>5} {share:>4}{mark}")
+    print("  * -- часть пропуска может быть узостью нашей реконструкции регекса,")
+    print("       а не свойством ключевых слов банка")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -378,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
                 out_row = {
                     "id_clean_post": doc["id_clean_post"],
                     "label_objects": row["label_objects"],
+                    "mention_objects": row["mention_objects"],
                     "confidence": row["confidence"],
                     "label_source": "openclaw",
                 }
@@ -387,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  батч {n}: размечено {len(result)}/{len(batch)}  (всего {len(done)})")
 
     # --- повторный слепой проход на подвыборке ---
-    recheck: dict[int, list[int]] = {}
+    recheck: dict[int, tuple[list[int], list[int]]] = {}
     if args.recheck_frac > 0 and done:
         rnd = random.Random(args.seed)
         pool = [d for d in queue if d["id_clean_post"] in done]
@@ -402,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  recheck {n}: ОШИБКА {exc}", file=sys.stderr)
                 continue
             for doc_id, row in result.items():
-                recheck[doc_id] = row["label_objects"]
+                recheck[doc_id] = (row["label_objects"], row["mention_objects"])
 
     report(done, queue, recheck)
     return 0

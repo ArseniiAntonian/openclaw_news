@@ -35,7 +35,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from patterns import BROAD_NET, OBJECT_PATTERNS  # noqa: E402
+from patterns import BROAD_NET, CONTROL_PATTERNS, OBJECT_PATTERNS  # noqa: E402
 
 # Сколько первых знаков текста считаем лидом новости.
 LEAD_CHARS = 300
@@ -156,7 +156,13 @@ def show_sample(docs, measures, idx, title, n, seed):
 
 
 def compact(doc: dict[str, Any], m: dict[str, Any], head_chars: int) -> dict[str, Any]:
-    """Урезанная запись для разметки: без полного текста."""
+    """Запись для разметки.
+
+    `control_objects` считается по ПОЛНОМУ тексту из пула, а не по обрезке,
+    которая уедет в промпт: контроль качества разметки не должен зависеть от
+    того, сколько текста показали модели.
+    """
+    full_text = f"{doc.get('title') or ''} {doc.get('text') or ''}"
     return {
         "id_clean_post": doc["id_clean_post"],
         "time_post": doc["time_post"],
@@ -166,7 +172,11 @@ def compact(doc: dict[str, Any], m: dict[str, Any], head_chars: int) -> dict[str
         "summary": doc.get("summary"),
         "text_head": (doc.get("text") or "")[:head_chars],
         "text_len": doc.get("text_len"),
+        "text_truncated_for_prompt": len(doc.get("text") or "") > head_chars,
         "matched_objects": doc.get("matched_objects"),
+        "control_objects": sorted(
+            {p.object_id for p in CONTROL_PATTERNS if p.compiled().search(full_text)}
+        ),
         "topic_hits": m["topic_hits"],
         "in_title": m["in_title"],
         "label_objects": None,
@@ -181,8 +191,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="куда писать очередь на разметку; без него -- только статистика")
     ap.add_argument("--min-hits", type=int, default=3,
                     help="порог по числу упоминаний темы (по умолчанию 3)")
-    ap.add_argument("--head-chars", type=int, default=800,
-                    help="сколько знаков текста класть в очередь на разметку")
+    ap.add_argument("--head-chars", type=int, default=4000,
+                    help="сколько знаков текста класть в очередь на разметку. "
+                         "Должно быть сопоставимо с тем, что видит регекс "
+                         "(до 6000): на 800 знаках первый прогон сравнивал "
+                         "методы на разных входных данных и был испорчен")
     ap.add_argument("--sample", type=int, default=25, help="размер показываемых выборок")
     ap.add_argument("--seed", type=int, default=17)
     return ap.parse_args(argv)
