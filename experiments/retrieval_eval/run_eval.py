@@ -314,7 +314,33 @@ def main(argv: list[str] | None = None) -> int:
                 cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
                 print(f"    vector:{form:<9} {cells}")
 
-            # 3. Вариант B из хэндоффа: объединение регекса и вектора.
+            # 3. Цепочка из архитектурной схемы банка (2026-07-31): сначала
+            # семантический поиск, ЗАТЕМ фильтр по ключевым словам и
+            # негатив-фильтр по отобранному. Это пересечение, а не
+            # объединение, поэтому recall цепочки ограничен сверху recall'ом
+            # ключевых слов -- всё, что вектор нашёл, а каталог не ловит,
+            # отсекается вторым шагом. Меряем явно, чтобы цена этого решения
+            # была числом, а не рассуждением.
+            regex_filtered = regex_hits(conn, pattern.regex, pattern.negative)
+            chain_form = max(
+                ("name", "aliases", "description"),
+                key=lambda f: row["methods"][f"vector:{f}"]["recall_at_k"][max_k],
+            )
+            chain_vector = embed_v5.openrouter_embed(
+                [queries[chain_form]], api_key=api_key,
+                model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
+                base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
+            )[0]
+            chain_ranked = vector_hits(conn, embed_v5.vector_literal(chain_vector), max_k)
+            chain_per_k = {}
+            for k in sorted(args.ks):
+                chain_per_k[k] = recall(set(chain_ranked[:k]) & regex_filtered, positives)
+            row["methods"][f"схема: vector:{chain_form} → ключевые слова"] = {
+                "recall_at_k": chain_per_k}
+            cells = "  ".join(f"@{k} {chain_per_k[k]:5.1%}" for k in sorted(args.ks))
+            print(f"    схема (И)        {cells}")
+
+            # 4. Вариант B из хэндоффа: объединение регекса и вектора.
             regex_set = regex_hits(conn, pattern.regex, None)
             best_form = max(
                 ("name", "aliases", "description"),
