@@ -204,6 +204,20 @@ def regex_hits(conn, pattern: str, negative: str | None) -> set[int]:
         return {row[0] for row in cur.fetchall()}
 
 
+def set_ef_search(conn, ef_search: int) -> None:
+    """Расширить список кандидатов HNSW на время сессии.
+
+    У pgvector `hnsw.ef_search` по умолчанию 40: индекс держит кандидатный
+    список такого размера, и запрос с `LIMIT` больше него возвращает строки,
+    но ранжирование за пределами ef_search уже не настоящее. На замере это
+    выглядит как recall, замерший на одном значении при росте K, и как
+    совпадающие результаты у разных запросов -- ровно то, что и вылезло на
+    первом прогоне. ef_search обязан быть не меньше максимального K.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SET hnsw.ef_search = %s", (ef_search,))
+
+
 def vector_hits(conn, vector_literal: str, limit: int) -> list[int]:
     """Топ-K по косинусу. Порядок сохраняется -- он нужен для recall@K."""
     with conn.cursor() as cur:
@@ -234,6 +248,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-positives", type=int, default=5,
                     help="объекты с меньшим числом положительных не мерим -- шум")
     ap.add_argument("--ks", type=int, nargs="+", default=list(DEFAULT_KS))
+    ap.add_argument("--ef-search", type=int, default=None,
+                    help="hnsw.ef_search на сессию. По умолчанию вдвое больше "
+                         "максимального K (потолок 1000). Значение ниже "
+                         "максимального K делает глубокие K бессмысленными")
     ap.add_argument("--examples", type=int, default=5,
                     help="сколько заголовков показывать в каждой категории примеров")
     ap.add_argument("--exclude-objects", type=int, nargs="*", default=[],
@@ -286,7 +304,14 @@ def main(argv: list[str] | None = None) -> int:
     print("Смещение эталона -- в пользу регекса (см. шапку файла): его "
           "проигрыш значим, выигрыш -- нет.\n")
 
+    ef_search = args.ef_search or min(1000, max_k * 2)
+    if ef_search < max_k:
+        print(f"ВНИМАНИЕ: ef_search={ef_search} меньше максимального K={max_k}; "
+              f"глубокие K будут недостоверны", file=sys.stderr)
+
     with psycopg.connect(dsn) as conn:
+        set_ef_search(conn, ef_search)
+        print(f"hnsw.ef_search = {ef_search}\n")
         for object_id in sorted(truth):
             positives = truth[object_id]
             pattern = by_id[object_id]
