@@ -44,6 +44,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--queue", type=Path, required=True)
     ap.add_argument("--labels", type=Path, required=True)
     ap.add_argument("--sample", type=int, default=8, help="сколько заголовков показать в примерах")
+    ap.add_argument("--object", type=int, default=None,
+                    help="показать заголовки всех трёх категорий по одному объекту")
     args = ap.parse_args(argv)
 
     for path in (args.queue, args.labels):
@@ -91,6 +93,39 @@ def main(argv: list[str] | None = None) -> int:
     print("развести их без настоящих паттернов банка нельзя.")
     print("«только регекс» = документ поймали ключевые слова, а модель не подтвердила:")
     print("это ложные срабатывания ключевых слов (или пропуск модели).")
+
+    # Разбор одного объекта целиком: три категории с заголовками. Нужен,
+    # когда контроль показал расхождение и надо понять, кто именно не прав --
+    # регекс, модель или постановка вопроса в промпте разметки.
+    if args.object is not None:
+        target = next((p for p in OBJECT_PATTERNS if p.object_id == args.object), None)
+        if target is None:
+            print(f"ERROR: объекта {args.object} нет в каталоге", file=sys.stderr)
+            return 1
+        groups: dict[str, list[int]] = {"оба": [], "только модель": [], "только регекс": []}
+        for doc_id, doc in queue.items():
+            row = labels.get(doc_id)
+            if row is None:
+                continue
+            by_model = args.object in (row.get("label_objects") or [])
+            by_regex = args.object in (doc.get("matched_objects") or [])
+            if by_model and by_regex:
+                groups["оба"].append(doc_id)
+            elif by_model:
+                groups["только модель"].append(doc_id)
+            elif by_regex:
+                groups["только регекс"].append(doc_id)
+
+        print(f"\n=== Объект {args.object}: {target.label} ===")
+        for name, ids in groups.items():
+            print(f"\n--- {name}: {len(ids)}")
+            if name == "только регекс" and ids:
+                print("    (ключевые слова сработали, модель не подтвердила —")
+                print("     смотри, правда ли эти новости про объект)")
+            for doc_id in ids[: args.sample]:
+                conf = (labels[doc_id].get("confidence") or "?")[:4]
+                print(f"    [{conf:>4}] {(queue[doc_id].get('title') or '')[:88]}")
+        return 0
 
     # Примеры для глаз: без них таблица не интерпретируется.
     worst = max(OBJECT_PATTERNS, key=lambda p: sum(
