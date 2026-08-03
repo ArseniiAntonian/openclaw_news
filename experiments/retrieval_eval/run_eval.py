@@ -68,6 +68,7 @@ from patterns import OBJECT_PATTERNS, to_postgres  # noqa: E402
 from queries import MULTI_QUERIES, QUERIES  # noqa: E402,F401
 
 SCHEMA = "agent_1_v5"
+ALT_SCHEMA = "retrieval_eval"
 DEFAULT_ENV = Path("/root/.openclaw/workspace/agents/agent_1/.env")
 DEFAULT_KS = (10, 50, 100, 500)
 
@@ -137,7 +138,8 @@ def fetch_titles(conn, ids: set[int]) -> dict[int, str]:
         return {row[0]: row[1] for row in cur.fetchall()}
 
 
-def regex_hits(conn, pattern: str, negative: str | None) -> set[int]:
+def regex_hits(conn, pattern: str, negative: str | None,
+               universe: list[int] | None = None) -> set[int]:
     sql = f"""
         SELECT c.id_clean_post
         FROM {SCHEMA}.clean_posts c
@@ -149,6 +151,9 @@ def regex_hits(conn, pattern: str, negative: str | None) -> set[int]:
     if negative:
         sql += "  AND (coalesce(r.title,'') || ' ' || coalesce(c.clean_content,'')) !~* %s\n"
         params.append(to_postgres(negative))
+    if universe is not None:
+        sql += "  AND c.id_clean_post = ANY(%s)\n"
+        params.append(universe)
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return {row[0] for row in cur.fetchall()}
@@ -170,7 +175,8 @@ def build_tsquery(text: str) -> str:
     return " | ".join(seen)
 
 
-def lexical_hits(conn, tsquery: str, limit: int) -> list[int]:
+def lexical_hits(conn, tsquery: str, limit: int,
+                 universe: list[int] | None = None) -> list[int]:
     """Лексический канал: полнотекстовый поиск Postgres с русской морфологией.
 
     Ключевые слова каталога -- это регекс, то есть совпадение подстроки и
@@ -192,6 +198,7 @@ def lexical_hits(conn, tsquery: str, limit: int) -> list[int]:
             JOIN {SCHEMA}.raw_posts r ON r.id_raw_post = c.id_raw_post,
                  q
             WHERE c.drop_reason IS NULL AND c.is_duplicate = FALSE
+              AND (%s::bigint[] IS NULL OR c.id_clean_post = ANY(%s::bigint[]))
               AND to_tsvector('russian',
                     coalesce(r.title,'') || ' ' || coalesce(c.clean_content,'')) @@ q.tsq
             ORDER BY ts_rank_cd(
@@ -199,7 +206,7 @@ def lexical_hits(conn, tsquery: str, limit: int) -> list[int]:
                     coalesce(r.title,'') || ' ' || coalesce(c.clean_content,'')), q.tsq) DESC
             LIMIT %s
             """,
-            (tsquery, limit),
+            (tsquery, universe, universe, limit),
         )
         return [row[0] for row in cur.fetchall()]
 
@@ -221,6 +228,53 @@ def rrf_fuse(ranked_lists: list[list[int]], k_const: int = 60) -> list[int]:
         for rank, doc_id in enumerate(lst, start=1):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k_const + rank)
     return [doc_id for doc_id, _ in sorted(scores.items(), key=lambda kv: -kv[1])]
+
+
+def universe_ids(conn, model: str) -> list[int]:
+    """Идентификаторы документов, посчитанных альтернативной моделью.
+
+    Сравнивать модели можно только на одной и той же вселенной: у меньшего
+    стога recall выше у всех методов сразу, и без этого ограничения новая
+    модель «выиграет» просто потому, что искала среди семи тысяч документов
+    вместо сорока.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT id_clean_post FROM {ALT_SCHEMA}.doc_embeddings WHERE model = %s",
+            (model,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def alt_query_vector(conn, model: str, object_id: int, form: str) -> str | None:
+    """Вектор запроса, посчитанный ТОЙ ЖЕ моделью, что и документы."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT embedding::text FROM {ALT_SCHEMA}.query_embeddings
+            WHERE model = %s AND object_id = %s AND form = %s
+            """,
+            (model, object_id, form),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def alt_vector_hits(conn, model: str, vector_literal: str, limit: int,
+                    universe: list[int] | None = None) -> list[int]:
+    sql = f"""
+        SELECT d.id_clean_post
+        FROM {ALT_SCHEMA}.doc_embeddings d
+        JOIN {SCHEMA}.clean_posts c ON c.id_clean_post = d.id_clean_post
+        WHERE d.model = %s
+          AND c.drop_reason IS NULL AND c.is_duplicate = FALSE
+          AND (%s::bigint[] IS NULL OR d.id_clean_post = ANY(%s::bigint[]))
+        ORDER BY d.embedding <=> %s::vector
+        LIMIT %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (model, universe, universe, vector_literal, limit))
+        return [row[0] for row in cur.fetchall()]
 
 
 def set_ef_search(conn, ef_search: int) -> None:
@@ -248,7 +302,8 @@ def set_ef_search(conn, ef_search: int) -> None:
         )
 
 
-def vector_hits(conn, vector_literal: str, limit: int) -> list[int]:
+def vector_hits(conn, vector_literal: str, limit: int,
+                universe: list[int] | None = None) -> list[int]:
     """Топ-K по косинусу. Порядок сохраняется -- он нужен для recall@K."""
     with conn.cursor() as cur:
         cur.execute(
@@ -257,10 +312,11 @@ def vector_hits(conn, vector_literal: str, limit: int) -> list[int]:
             FROM {SCHEMA}.clean_posts c
             WHERE c.drop_reason IS NULL AND c.is_duplicate = FALSE
               AND c.embedding IS NOT NULL
+              AND (%s::bigint[] IS NULL OR c.id_clean_post = ANY(%s::bigint[]))
             ORDER BY c.embedding <=> %s::vector
             LIMIT %s
             """,
-            (vector_literal, limit),
+            (universe, universe, vector_literal, limit),
         )
         return [row[0] for row in cur.fetchall()]
 
@@ -290,6 +346,12 @@ def main(argv: list[str] | None = None) -> int:
                          "формулировки собрал 293 метки «только модель» против "
                          "2 совпадений с каталогом, то есть стал означать "
                          "«любая новость, где кто-то высказался об ИИ»")
+    ap.add_argument("--alt-model", default=None,
+                    help="мерить вектор на другой модели из retrieval_eval.doc_embeddings")
+    ap.add_argument("--universe-model", default=None,
+                    help="ограничить вселенную документами, посчитанными этой моделью. "
+                         "Нужно, чтобы сравнивать модели на одном сэмпле: у меньшего "
+                         "стога recall выше у всех методов сразу")
     ap.add_argument("--relation", choices=("event", "any"), default="event",
                     help="что считать положительным: только события (по умолчанию) "
                          "или события вместе с упоминаниями -- второе ближе к тому, "
@@ -341,6 +403,33 @@ def main(argv: list[str] | None = None) -> int:
 
     with psycopg.connect(dsn) as conn:
         set_ef_search(conn, ef_search)
+
+        universe = universe_ids(conn, args.universe_model) if args.universe_model else None
+        if universe is not None:
+            print(f"Вселенная ограничена {len(universe)} документами "
+                  f"(модель {args.universe_model})")
+        if args.alt_model:
+            print(f"Векторный канал: {args.alt_model} из {ALT_SCHEMA}.doc_embeddings")
+
+        def ranked_for(object_id: int, form: str, text: str) -> list[int]:
+            """Топ-K по одной форме запроса, на текущей модели.
+
+            Скрывает выбор между OpenRouter и предпосчитанными векторами
+            альтернативной модели: остальной код не должен об этом знать.
+            """
+            if args.alt_model:
+                lit = alt_query_vector(conn, args.alt_model, object_id, form)
+                if lit is None:
+                    raise RuntimeError(
+                        f"нет вектора запроса: модель {args.alt_model}, "
+                        f"объект {object_id}, форма {form}")
+                return alt_vector_hits(conn, args.alt_model, lit, max_k, universe)
+            vec = embed_v5.openrouter_embed(
+                [text], api_key=api_key,
+                model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
+                base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
+            )[0]
+            return vector_hits(conn, embed_v5.vector_literal(vec), max_k, universe)
         print(f"hnsw.ef_search = {ef_search}\n")
         for object_id in sorted(truth):
             positives = truth[object_id]
@@ -356,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
 
             # 1. Ключевые слова каталога, с негатив-фильтром и без него.
             for name, neg in (("regex", None), ("regex+негатив", pattern.negative)):
-                hits = regex_hits(conn, pattern.regex, neg)
+                hits = regex_hits(conn, pattern.regex, neg, universe)
                 value = recall(hits, positives)
                 row["methods"][name] = {"recall": value, "returned": len(hits)}
                 print(f"    {name:<16} recall {value:5.1%}   поднято документов: {len(hits)}")
@@ -364,13 +453,7 @@ def main(argv: list[str] | None = None) -> int:
             # 2. Три формы запроса через вектор.
             vector_ranked_by_form: dict[str, list[int]] = {}
             for form in ("name", "aliases", "description"):
-                text = queries[form]
-                vector = embed_v5.openrouter_embed(
-                    [text], api_key=api_key,
-                    model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
-                    base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
-                )[0]
-                ranked = vector_hits(conn, embed_v5.vector_literal(vector), max_k)
+                ranked = ranked_for(object_id, form, queries[form])
                 vector_ranked_by_form[form] = ranked
                 per_k = {}
                 for k in sorted(args.ks):
@@ -389,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
             # своё ранжирование, документ, уверенно поднятый любым из них,
             # выходит наверх, и разделять объекты на типы не требуется.
             tsq = build_tsquery(queries["aliases"])
-            lex_ranked = lexical_hits(conn, tsq, max_k)
+            lex_ranked = lexical_hits(conn, tsq, max_k, universe)
             per_k = {k: recall(set(lex_ranked[:k]), positives) for k in sorted(args.ks)}
             row["methods"]["лексический (FTS)"] = {"recall_at_k": per_k,
                                                    "returned": len(lex_ranked)}
@@ -417,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             # каждого из n запросов берётся top-(K/n). Иначе мультизапрос
             # выигрывал бы просто тем, что достаёт больше документов, и
             # сравнение ничего бы не значило.
-            if object_id in MULTI_QUERIES:
+            if object_id in MULTI_QUERIES and not args.alt_model:
                 texts = MULTI_QUERIES[object_id]
                 vectors = embed_v5.openrouter_embed(
                     texts, api_key=api_key,
@@ -425,7 +508,8 @@ def main(argv: list[str] | None = None) -> int:
                     base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
                 )
                 ranked_lists = [
-                    vector_hits(conn, embed_v5.vector_literal(v), max_k) for v in vectors
+                    vector_hits(conn, embed_v5.vector_literal(v), max_k, universe)
+                    for v in vectors
                 ]
                 per_k = {}
                 for k in sorted(args.ks):
@@ -445,17 +529,12 @@ def main(argv: list[str] | None = None) -> int:
             # ключевых слов -- всё, что вектор нашёл, а каталог не ловит,
             # отсекается вторым шагом. Меряем явно, чтобы цена этого решения
             # была числом, а не рассуждением.
-            regex_filtered = regex_hits(conn, pattern.regex, pattern.negative)
+            regex_filtered = regex_hits(conn, pattern.regex, pattern.negative, universe)
             chain_form = max(
                 ("name", "aliases", "description"),
                 key=lambda f: row["methods"][f"vector:{f}"]["recall_at_k"][max_k],
             )
-            chain_vector = embed_v5.openrouter_embed(
-                [queries[chain_form]], api_key=api_key,
-                model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
-                base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
-            )[0]
-            chain_ranked = vector_hits(conn, embed_v5.vector_literal(chain_vector), max_k)
+            chain_ranked = vector_ranked_by_form[chain_form]
             chain_per_k = {}
             for k in sorted(args.ks):
                 chain_per_k[k] = recall(set(chain_ranked[:k]) & regex_filtered, positives)
@@ -465,18 +544,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    схема (И)        {cells}")
 
             # 4. Вариант B из хэндоффа: объединение регекса и вектора.
-            regex_set = regex_hits(conn, pattern.regex, None)
+            regex_set = regex_hits(conn, pattern.regex, None, universe)
             best_form = max(
                 ("name", "aliases", "description"),
                 key=lambda f: row["methods"][f"vector:{f}"]["recall_at_k"][max_k],
             )
-            vector_best = embed_v5.openrouter_embed(
-                [queries[best_form]], api_key=api_key,
-                model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
-                base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
-            )[0]
             union_k = min(max_k, 100)
-            ranked_best = vector_hits(conn, embed_v5.vector_literal(vector_best), union_k)
+            ranked_best = vector_ranked_by_form[best_form][:union_k]
             union = regex_set | set(ranked_best)
             value = recall(union, positives)
             row["methods"][f"regex ∪ vector:{best_form}@{union_k}"] = {
