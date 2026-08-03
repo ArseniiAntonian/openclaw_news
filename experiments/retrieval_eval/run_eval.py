@@ -312,17 +312,37 @@ def main(argv: list[str] | None = None) -> int:
             # объекта. Замер показал, что чем ближе форма запроса к тексту
             # новости, тем выше recall; HyDE доводит это до предела -- запрос
             # строится сразу в пространстве документов.
+            # Три регистра меряются по отдельности: вектор кодирует не только
+            # смысл, но и стиль, а корпус неоднороден (61% телеграм). Если
+            # регистры дадут близкий recall -- чувствительность к формату для
+            # этого корпуса несущественна. Если разойдутся -- ответом будет
+            # объединение регистров, оно считается тут же при равном бюджете.
             if object_id in HYDE:
-                vector = embed_v5.openrouter_embed(
-                    [HYDE[object_id]], api_key=api_key,
-                    model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
-                    base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
-                )[0]
-                ranked = vector_hits(conn, embed_v5.vector_literal(vector), max_k)
-                per_k = {k: recall(set(ranked[:k]), positives) for k in sorted(args.ks)}
-                row["methods"]["vector:hyde"] = {"recall_at_k": per_k}
+                registers = HYDE[object_id]
+                hyde_ranked: dict[str, list[int]] = {}
+                for reg, text in registers.items():
+                    vector = embed_v5.openrouter_embed(
+                        [text], api_key=api_key,
+                        model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
+                        base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
+                    )[0]
+                    ranked = vector_hits(conn, embed_v5.vector_literal(vector), max_k)
+                    hyde_ranked[reg] = ranked
+                    per_k = {k: recall(set(ranked[:k]), positives) for k in sorted(args.ks)}
+                    row["methods"][f"vector:hyde:{reg}"] = {"recall_at_k": per_k}
+                    cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
+                    print(f"    hyde:{reg:<12}{cells}")
+
+                per_k = {}
+                for k in sorted(args.ks):
+                    share = max(1, k // len(hyde_ranked))
+                    union_reg: set[int] = set()
+                    for lst in hyde_ranked.values():
+                        union_reg |= set(lst[:share])
+                    per_k[k] = recall(union_reg, positives)
+                row["methods"]["vector:hyde:все регистры"] = {"recall_at_k": per_k}
                 cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
-                print(f"    vector:hyde      {cells}")
+                print(f"    hyde:объединение {cells}   (равный бюджет)")
 
             # 2b. Мультизапрос: несколько запросов по граням объекта,
             # выдачи объединяются. Один вектор не может лежать одновременно
