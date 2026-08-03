@@ -72,7 +72,7 @@ from run_eval import (  # noqa: E402
 )
 
 DEFAULT_ENV = Path("/root/.openclaw/workspace/agents/agent_1/.env")
-DEFAULT_MODEL = "anthropic/claude-opus-5"
+DEFAULT_MODEL = "anthropic/claude-sonnet-5"
 DEFAULT_CE_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 REQUEST_TIMEOUT = 180
@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                          "llm -- модель через OpenRouter, ничего не ставить, но платно")
     ap.add_argument("--model", default=None,
                     help="имя модели. По умолчанию BAAI/bge-reranker-v2-m3 для "
-                         "crossenc и anthropic/claude-opus-5 для llm")
+                         "crossenc и anthropic/claude-sonnet-5 для llm")
     ap.add_argument("--form", choices=("name", "aliases", "description"),
                     default="description", help="форма запроса для первого этапа")
     ap.add_argument("--candidates", type=int, default=200,
