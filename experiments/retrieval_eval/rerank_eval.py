@@ -29,11 +29,23 @@
 `--backend llm` -- модель через OpenRouter. Ничего не ставить, но каждый
 прогон стоит денег, а оценки плавают от запуска к запуску.
 
-Изначально я взял LLM, отвергнув кросс-энкодер по двум причинам, и обе
-оказались неверны. Скорость я завысил: на процессоре с батчингом это
-порядка пяти-десяти пар в секунду, то есть минуты на весь прогон, а не на
-объект. А ограничение в 512 токенов не мешает, потому что документы и так
-режутся до `--doc-chars` (по умолчанию 1200 знаков, около 400 токенов).
+`--backend jina` -- настоящий кросс-энкодер, но на чужом железе:
+`POST /v1/rerank` у Jina. Считает их GPU, поэтому шесть наших ядер ни при
+чём; есть бесплатный лимит. Нужен ключ в JINA_API_KEY. Контракт удобнее
+всех: отдаёшь запрос и список документов, получаешь оценки -- ни батчей с
+JSON в тексте, ни парсинга ответа модели.
+
+История выбора, чтобы не ходить по кругу. Сперва я взял LLM, отвергнув
+кросс-энкодер по двум причинам, и обе оказались неверны: скорость я оценил
+с потолка, а ограничение в 512 токенов не мешает, потому что документы и
+так режутся до `--doc-chars`. Затем поставил кросс-энкодер по умолчанию --
+и замер показал 6.1 секунды на пару при шести ядрах, то есть 163 минуты на
+полный прогон. Локально он на этом железе не живёт, и это не лечится
+потоками: torch и так брал все шесть ядер.
+
+Отсюда нынешний расклад: `llm` работает сразу, но платно; `jina` бесплатна
+в пределах лимита, но требует чужого ключа; `crossenc` оставлен на случай,
+когда появится GPU.
 
 ## Как читать результат
 
@@ -74,6 +86,8 @@ from run_eval import (  # noqa: E402
 DEFAULT_ENV = Path("/root/.openclaw/workspace/agents/agent_1/.env")
 DEFAULT_MODEL = "anthropic/claude-sonnet-5"
 DEFAULT_CE_MODEL = "BAAI/bge-reranker-v2-m3"
+DEFAULT_JINA_MODEL = "jina-reranker-v2-base-multilingual"
+JINA_URL = "https://api.jina.ai/v1/rerank"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 REQUEST_TIMEOUT = 180
 RETRIES = 4
@@ -146,6 +160,44 @@ def chat(prompt: str, *, api_key: str, model: str, base_url: str,
     raise RuntimeError(f"реранкер не ответил после {RETRIES} попыток: {last}")
 
 
+def jina_rerank(query: str, documents: list[str], *, api_key: str,
+                model: str) -> list[float]:
+    """Оценки от Jina в порядке переданных документов.
+
+    Ответ приходит отсортированным по релевантности, с полем `index` --
+    позицией документа во входном списке. Раскладываем обратно по исходному
+    порядку: сортировкой занимается вызывающий код, и получить её дважды в
+    разных местах -- верный способ перепутать.
+    """
+    body = {"model": model, "query": query, "documents": documents,
+            "top_n": len(documents)}
+    last: Exception | None = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            resp = requests.post(
+                JINA_URL,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json=body, timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code in (401, 402, 403):
+                raise SystemExit(
+                    f"Jina отказала ({resp.status_code}): {resp.text[:300]}"
+                )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+            results = resp.json()["results"]
+            scores = [0.0] * len(documents)
+            for item in results:
+                scores[int(item["index"])] = float(item["relevance_score"])
+            return scores
+        except (requests.RequestException, RuntimeError, KeyError, ValueError) as exc:
+            last = exc
+            if attempt < RETRIES:
+                time.sleep(3 * attempt)
+    raise RuntimeError(f"Jina не ответила после {RETRIES} попыток: {last}")
+
+
 def parse_scores(raw: str) -> dict[int, float]:
     text = raw.strip()
     if text.startswith("```"):
@@ -188,9 +240,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--labels", type=Path, required=True)
     ap.add_argument("--out", type=Path, default=Path("data/rerank_report.json"))
     ap.add_argument("--cache", type=Path, default=Path("data/rerank_cache.jsonl"))
-    ap.add_argument("--backend", choices=("crossenc", "llm"), default="crossenc",
-                    help="crossenc -- локальный кросс-энкодер, бесплатен и детерминирован; "
-                         "llm -- модель через OpenRouter, ничего не ставить, но платно")
+    ap.add_argument("--backend", choices=("crossenc", "llm", "jina"), default="llm",
+                    help="llm -- через OpenRouter, работает сразу, но платно; "
+                         "jina -- кросс-энкодер по API, бесплатный лимит, нужен "
+                         "JINA_API_KEY; crossenc -- локально, на этом железе "
+                         "163 минуты на прогон, оставлен до появления GPU")
     ap.add_argument("--model", default=None,
                     help="имя модели. По умолчанию BAAI/bge-reranker-v2-m3 для "
                          "crossenc и anthropic/claude-sonnet-5 для llm")
@@ -215,7 +269,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.model is None:
-        args.model = DEFAULT_CE_MODEL if args.backend == "crossenc" else DEFAULT_MODEL
+        args.model = {"crossenc": DEFAULT_CE_MODEL,
+                      "jina": DEFAULT_JINA_MODEL}.get(args.backend, DEFAULT_MODEL)
+
+    jina_key = os.environ.get("JINA_API_KEY", "")
+    if args.backend == "jina" and not jina_key:
+        print("ERROR: нет JINA_API_KEY", file=sys.stderr)
+        return 1
 
     load_dotenv(args.env_file)
     dsn = os.environ.get(args.dsn_var)
@@ -293,6 +353,15 @@ def main(argv: list[str] | None = None) -> int:
             query_text = f"{pattern.label}. {QUERIES[object_id]['description']}"
 
             def score_batch(batch: list[int]) -> dict[int, float]:
+                if args.backend == "jina":
+                    texts = []
+                    for doc_id in batch:
+                        title, text = docs.get(doc_id, ("", ""))
+                        texts.append(f"{title}. {text}")
+                    scores = jina_rerank(query_text, texts,
+                                         api_key=jina_key, model=args.model)
+                    return {doc_id: v for doc_id, v in zip(batch, scores)}
+
                 if cross_encoder is not None:
                     # Кросс-энкодер получает пару целиком: запрос и документ в
                     # одном входе. Именно это и отличает его от первого этапа,
