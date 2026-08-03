@@ -132,6 +132,9 @@ def chat(prompt: str, *, api_key: str, model: str, base_url: str,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": max_tokens,
+        # Просим формат явно: это заметно снижает шанс, что модель добавит
+        # пояснение или сломает синтаксис в длинном ответе.
+        "response_format": {"type": "json_object"},
     }
     last: Exception | None = None
     for attempt in range(1, RETRIES + 1):
@@ -205,8 +208,20 @@ def parse_scores(raw: str) -> dict[int, float]:
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1:
         raise ValueError("в ответе нет JSON")
-    payload = json.loads(text[start : end + 1])
     out: dict[int, float] = {}
+    try:
+        payload = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        # Модель сломала JSON -- обычно лишняя запятая или кавычка в длинном
+        # ответе. Пары id/score всё равно читаемы поштучно, и вытащить их
+        # регуляркой лучше, чем потерять весь батч из-за одного символа.
+        for m in re.finditer(
+            r'"id"\s*:\s*(\d+)\s*,\s*"score"\s*:\s*([0-9]+(?:\.[0-9]+)?)', text
+        ):
+            out[int(m.group(1))] = float(m.group(2))
+        if out:
+            return out
+        raise
     for row in payload.get("scores") or []:
         if isinstance(row, dict) and isinstance(row.get("id"), int):
             try:
@@ -392,8 +407,22 @@ def main(argv: list[str] | None = None) -> int:
                 # потоки ему только мешают. Потоки нужны LLM, где время уходит
                 # на ожидание сети.
                 workers = 1 if cross_encoder is not None else args.workers
+                def safe_batch(batch: list[int]) -> dict[int, float]:
+                    """Батч, который не роняет прогон.
+
+                    Один испорченный ответ модели не должен стоить нам всех
+                    остальных объектов: документы этого батча останутся без
+                    оценки и уйдут в конец списка, что уже учтено ниже и
+                    печатается отдельной строкой.
+                    """
+                    try:
+                        return score_batch(batch)
+                    except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+                        print(f"      батч пропущен: {exc}", file=sys.stderr)
+                        return {}
+
                 with ThreadPoolExecutor(max_workers=workers) as pool:
-                    for n, scores in enumerate(pool.map(score_batch, batches), start=1):
+                    for n, scores in enumerate(pool.map(safe_batch, batches), start=1):
                         for doc_id, value in scores.items():
                             key = f"{object_id}:{doc_id}:{args.model}"
                             cache[key] = value
@@ -433,7 +462,30 @@ def main(argv: list[str] | None = None) -> int:
 
     cache_fh.close()
 
-    print("\n=== Итог: реранкер отдаёт вдвое меньше документов ===")
+    # ГЛАВНОЕ сравнение -- при ОДИНАКОВОЙ глубине: столько же документов,
+    # но отсортированных лучше. Сравнивать после@50 с до@100 нельзя как с
+    # основным показателем: пятьдесят документов дают меньше ста независимо
+    # от качества сортировки, и отрицательное число там означает арифметику,
+    # а не провал метода.
+    print("\n=== Прирост при одинаковой глубине ===")
+    print(f"{'об':>3} | {'@50 до':>7} {'@50 после':>10} {'Δ':>7}"
+          f" | {'@100 до':>8} {'@100 после':>11} {'Δ':>7}")
+    d50, d100 = [], []
+    for oid, row in sorted(report["objects"].items(), key=lambda kv: int(kv[0])):
+        b50, a50 = row["before"][50], row["after"][50]
+        b100, a100 = row["before"][100], row["after"][100]
+        d50.append(a50 - b50)
+        d100.append(a100 - b100)
+        print(f"{oid:>3} | {b50:>7.1%} {a50:>10.1%} {a50 - b50:>+7.1%}"
+              f" | {b100:>8.1%} {a100:>11.1%} {a100 - b100:>+7.1%}")
+    if d50:
+        print(f"{'':>3} | {'среднее':>7} {'':>10} {sum(d50)/len(d50):>+7.1%}"
+              f" | {'':>8} {'':>11} {sum(d100)/len(d100):>+7.1%}")
+
+    # Отдельный, ВТОРИЧНЫЙ вопрос: можно ли на этом сэкономить, отдав
+    # экстрактору вдвое меньше документов. Ответ «нет» здесь не отменяет
+    # прироста выше.
+    print("\n=== Вторичное: хватит ли 50 отсортированных вместо 100 исходных ===")
     print(f"{'об':>3} {'до@100':>8} {'после@50':>10} {'разница':>9}")
     deltas = []
     for oid, row in sorted(report["objects"].items(), key=lambda kv: int(kv[0])):
