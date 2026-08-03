@@ -155,7 +155,19 @@ def chat(prompt: str, *, api_key: str, model: str, base_url: str,
                 )
             if resp.status_code >= 400:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:400]}")
-            return resp.json()["choices"][0]["message"]["content"]
+            payload = resp.json()
+            choice = payload["choices"][0]
+            content = choice.get("message", {}).get("content")
+            if not content:
+                # Пустой content -- обычно значит, что выходной лимит съеден
+                # рассуждением модели и на сам ответ ничего не осталось.
+                # Сообщаем причину и расход, иначе выше прилетит невнятное
+                # "NoneType has no attribute strip".
+                raise RuntimeError(
+                    f"пустой ответ: finish_reason={choice.get('finish_reason')}, "
+                    f"usage={payload.get('usage')}, max_tokens={max_tokens}"
+                )
+            return content
         except (requests.RequestException, RuntimeError, KeyError, ValueError) as exc:
             last = exc
             if attempt < RETRIES:
@@ -396,8 +408,10 @@ def main(argv: list[str] | None = None) -> int:
                                         description=QUERIES[object_id]["description"],
                                         n=len(batch))
                           + "\n\n".join(blocks))
-                # ~40 токенов на запись плюс запас на обёртку JSON.
-                budget = 200 + 40 * len(batch)
+                # Щедро: сами оценки занимают около 15 токенов на запись, но
+                # рассуждающая модель тратит выходной лимит и на размышление,
+                # и при скупом бюджете возвращает пустой content.
+                budget = 1500 + 60 * len(batch)
                 return parse_scores(chat(prompt, api_key=api_key, model=args.model,
                                          base_url=base_url, max_tokens=budget))
 
@@ -417,7 +431,8 @@ def main(argv: list[str] | None = None) -> int:
                     """
                     try:
                         return score_batch(batch)
-                    except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+                    except (ValueError, json.JSONDecodeError, RuntimeError,
+                            AttributeError, TypeError, KeyError) as exc:
                         print(f"      батч пропущен: {exc}", file=sys.stderr)
                         return {}
 
