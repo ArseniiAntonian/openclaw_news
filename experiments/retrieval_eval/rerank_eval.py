@@ -267,7 +267,12 @@ def main(argv: list[str] | None = None) -> int:
             row: dict[str, Any] = {"label": pattern.label, "positives": len(positives),
                                    "unscored": len(missing), "before": {}, "after": {}}
             print(f"    {'K':>5} {'до реранка':>12} {'после':>10}")
-            for k in (10, 20, 50, 100, args.candidates):
+            # Дедупликация глубин: при --candidates 50 список (10,20,50,100,50)
+            # печатал K=50 дважды. И K больше числа кандидатов бессмысленны --
+            # recall там упирается в размер выдачи, а не в метод.
+            depths = sorted({k for k in (10, 20, 50, 100, args.candidates)
+                             if k <= args.candidates})
+            for k in depths:
                 before = recall(set(ranked[:k]), positives)
                 after = recall(set(reranked[:k]), positives)
                 row["before"][k] = before
