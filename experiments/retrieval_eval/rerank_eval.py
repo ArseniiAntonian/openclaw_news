@@ -18,16 +18,22 @@
 который первый этап поставил на 180-е место. Но он **не может** найти то, что
 первый этап не принёс: всё, чего нет в топ-N, для него не существует.
 
-## Почему LLM, а не кросс-энкодер
+## Два бэкенда
 
-Классический выбор -- `bge-reranker-v2-m3`. На нашем сервере нет GPU, а на
-процессоре пара считается около секунды: двести кандидатов -- пять минут на
-объект. Плюс окно 512 токенов обрежет документы, которые мы только что
-перестали обрезать.
+`--backend crossenc` -- `bge-reranker-v2-m3`, классический кросс-энкодер.
+После установки бесплатен при любом числе прогонов и детерминирован:
+одинаковый вход даёт одинаковые оценки. Для замера, где мы ловим разницу в
+три-пять пунктов, второе важно не меньше первого. Цена -- torch и веса,
+пара гигабайт на диске.
 
-LLM через OpenRouter не требует ни нового ключа, ни установки, держит длинный
-контекст и знает русский. Качество LLM-реранкеров сопоставимо с
-кросс-энкодерами. Плата -- недетерминизм и стоимость за объём.
+`--backend llm` -- модель через OpenRouter. Ничего не ставить, но каждый
+прогон стоит денег, а оценки плавают от запуска к запуску.
+
+Изначально я взял LLM, отвергнув кросс-энкодер по двум причинам, и обе
+оказались неверны. Скорость я завысил: на процессоре с батчингом это
+порядка пяти-десяти пар в секунду, то есть минуты на весь прогон, а не на
+объект. А ограничение в 512 токенов не мешает, потому что документы и так
+режутся до `--doc-chars` (по умолчанию 1200 знаков, около 400 токенов).
 
 ## Как читать результат
 
@@ -37,7 +43,8 @@ LLM через OpenRouter не требует ни нового ключа, ни
 
 Оценки кэшируются в файл, поэтому повторный запуск не переспрашивает модель.
 
-    python rerank_eval.py --labels data/labels_v2.jsonl --exclude-objects 9
+    python rerank_eval.py --labels data/labels_v2.jsonl --exclude-objects 9 \\
+        --backend crossenc --model BAAI/bge-reranker-v2-m3
 """
 
 from __future__ import annotations
@@ -66,6 +73,7 @@ from run_eval import (  # noqa: E402
 
 DEFAULT_ENV = Path("/root/.openclaw/workspace/agents/agent_1/.env")
 DEFAULT_MODEL = "anthropic/claude-opus-5"
+DEFAULT_CE_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 REQUEST_TIMEOUT = 180
 RETRIES = 4
@@ -180,9 +188,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--labels", type=Path, required=True)
     ap.add_argument("--out", type=Path, default=Path("data/rerank_report.json"))
     ap.add_argument("--cache", type=Path, default=Path("data/rerank_cache.jsonl"))
-    ap.add_argument("--model", default=DEFAULT_MODEL,
-                    help="модель через OpenRouter. Дороже -- точнее; для объёмного "
-                         "скоринга можно взять модель полегче")
+    ap.add_argument("--backend", choices=("crossenc", "llm"), default="crossenc",
+                    help="crossenc -- локальный кросс-энкодер, бесплатен и детерминирован; "
+                         "llm -- модель через OpenRouter, ничего не ставить, но платно")
+    ap.add_argument("--model", default=None,
+                    help="имя модели. По умолчанию BAAI/bge-reranker-v2-m3 для "
+                         "crossenc и anthropic/claude-opus-5 для llm")
     ap.add_argument("--form", choices=("name", "aliases", "description"),
                     default="description", help="форма запроса для первого этапа")
     ap.add_argument("--candidates", type=int, default=200,
@@ -197,12 +208,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dsn-var", default="AGENT_1_DB_DSN")
     args = ap.parse_args(argv)
 
+    if args.model is None:
+        args.model = DEFAULT_CE_MODEL if args.backend == "crossenc" else DEFAULT_MODEL
+
     load_dotenv(args.env_file)
     dsn = os.environ.get(args.dsn_var)
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not dsn or not api_key:
-        print("ERROR: нет AGENT_1_DB_DSN или OPENROUTER_API_KEY", file=sys.stderr)
+    if not dsn:
+        print("ERROR: нет AGENT_1_DB_DSN", file=sys.stderr)
         return 1
+    if not api_key:
+        # Ключ нужен всегда: первый этап (векторный отбор) идёт через
+        # OpenRouter независимо от того, чем реранкуем.
+        print("ERROR: нет OPENROUTER_API_KEY (нужен для векторного отбора)", file=sys.stderr)
+        return 1
+
+    cross_encoder = None
+    if args.backend == "crossenc":
+        from sentence_transformers import CrossEncoder  # noqa: E402
+
+        print(f"Загружаю кросс-энкодер {args.model} (процессор)…")
+        cross_encoder = CrossEncoder(args.model, device="cpu", max_length=512)
     base_url = os.environ.get("OPENROUTER_BASE_URL", DEFAULT_BASE_URL)
 
     from agent_1 import embed_v5  # noqa: E402
@@ -248,7 +274,20 @@ def main(argv: list[str] | None = None) -> int:
 
             batches = [todo[i : i + args.batch] for i in range(0, len(todo), args.batch)]
 
+            query_text = f"{pattern.label}. {QUERIES[object_id]['description']}"
+
             def score_batch(batch: list[int]) -> dict[int, float]:
+                if cross_encoder is not None:
+                    # Кросс-энкодер получает пару целиком: запрос и документ в
+                    # одном входе. Именно это и отличает его от первого этапа,
+                    # где оба сжимались в векторы по отдельности.
+                    pairs = []
+                    for doc_id in batch:
+                        title, text = docs.get(doc_id, ("", ""))
+                        pairs.append([query_text, f"{title}. {text}"])
+                    scores = cross_encoder.predict(pairs, show_progress_bar=False)
+                    return {doc_id: float(v) for doc_id, v in zip(batch, scores)}
+
                 blocks = []
                 for doc_id in batch:
                     title, text = docs.get(doc_id, ("", ""))
@@ -264,7 +303,11 @@ def main(argv: list[str] | None = None) -> int:
 
             if batches:
                 started = time.time()
-                with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                # Кросс-энкодер и так батчится внутри и держит один процесс;
+                # потоки ему только мешают. Потоки нужны LLM, где время уходит
+                # на ожидание сети.
+                workers = 1 if cross_encoder is not None else args.workers
+                with ThreadPoolExecutor(max_workers=workers) as pool:
                     for n, scores in enumerate(pool.map(score_batch, batches), start=1):
                         for doc_id, value in scores.items():
                             key = f"{object_id}:{doc_id}:{args.model}"
