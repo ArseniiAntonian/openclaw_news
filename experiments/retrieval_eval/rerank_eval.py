@@ -94,12 +94,22 @@ PROMPT = """Ты оцениваешь релевантность новосте�
 """
 
 
-def chat(prompt: str, *, api_key: str, model: str, base_url: str) -> str:
+def chat(prompt: str, *, api_key: str, model: str, base_url: str,
+         max_tokens: int) -> str:
+    """Один запрос к модели.
+
+    `max_tokens` задаётся явно и намеренно скупо. OpenRouter резервирует
+    кредиты под заявленный потолок ответа, а не под фактический: без этого
+    параметра подставляется значение по умолчанию (65536), и запрос падает
+    с HTTP 402 «недостаточно кредитов», хотя ответ занимает полторы сотни
+    токенов -- десяток строк JSON с оценками.
+    """
     url = f"{base_url.rstrip('/')}/chat/completions"
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
+        "max_tokens": max_tokens,
     }
     last: Exception | None = None
     for attempt in range(1, RETRIES + 1):
@@ -110,6 +120,14 @@ def chat(prompt: str, *, api_key: str, model: str, base_url: str) -> str:
                          "Content-Type": "application/json"},
                 json=body, timeout=REQUEST_TIMEOUT,
             )
+            if resp.status_code == 402:
+                # Кредитов не хватает -- повторять бессмысленно, они не
+                # появятся сами. Падаем сразу, не тратя попытки.
+                raise SystemExit(
+                    "OpenRouter: недостаточно кредитов. "
+                    f"Модель {model}, max_tokens={max_tokens}. "
+                    f"Возьми модель дешевле через --model. {resp.text[:300]}"
+                )
             if resp.status_code >= 400:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:400]}")
             return resp.json()["choices"][0]["message"]["content"]
@@ -239,8 +257,10 @@ def main(argv: list[str] | None = None) -> int:
                                         description=QUERIES[object_id]["description"],
                                         n=len(batch))
                           + "\n\n".join(blocks))
+                # ~40 токенов на запись плюс запас на обёртку JSON.
+                budget = 200 + 40 * len(batch)
                 return parse_scores(chat(prompt, api_key=api_key, model=args.model,
-                                         base_url=base_url))
+                                         base_url=base_url, max_tokens=budget))
 
             if batches:
                 started = time.time()
