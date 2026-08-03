@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -64,7 +65,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, "/root/.openclaw/workspace/agents/agent_1/src")
 
 from patterns import OBJECT_PATTERNS, to_postgres  # noqa: E402
-from queries import HYDE, MULTI_QUERIES, QUERIES  # noqa: E402,F401
+from queries import MULTI_QUERIES, QUERIES  # noqa: E402,F401
 
 SCHEMA = "agent_1_v5"
 DEFAULT_ENV = Path("/root/.openclaw/workspace/agents/agent_1/.env")
@@ -151,6 +152,75 @@ def regex_hits(conn, pattern: str, negative: str | None) -> set[int]:
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return {row[0] for row in cur.fetchall()}
+
+
+def build_tsquery(text: str) -> str:
+    """Плоский набор слов -> tsquery через OR.
+
+    `websearch_to_tsquery` соединяет слова через AND, а нам нужен именно OR:
+    список алиасов -- это варианты написания одного объекта, а не условия,
+    которые обязаны выполниться разом.
+    """
+    seen: list[str] = []
+    # Дефис тоже разделитель: "дата-центры" в to_tsquery -- риск
+    # синтаксической ошибки, а для OR-запроса части годятся по отдельности.
+    for token in re.split(r"[^\w]+", text.lower(), flags=re.UNICODE):
+        if len(token) >= 3 and token not in seen:
+            seen.append(token)
+    return " | ".join(seen)
+
+
+def lexical_hits(conn, tsquery: str, limit: int) -> list[int]:
+    """Лексический канал: полнотекстовый поиск Postgres с русской морфологией.
+
+    Ключевые слова каталога -- это регекс, то есть совпадение подстроки и
+    множество на выходе. Полнотекстовый поиск приводит слова к нормальной
+    форме и возвращает РАНЖИРОВАННЫЙ список. Ранг здесь принципиален: только
+    ранжирование можно слить с векторным каналом.
+
+    Индекса под это нет, `to_tsvector` считается на лету по всему корпусу,
+    поэтому запрос идёт секунды-десятки секунд. Для эксперимента приемлемо;
+    в продакшне нужен GIN-индекс, но это изменение схемы Агента 1, и здесь
+    оно не делается.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            WITH q AS (SELECT to_tsquery('russian', %s) AS tsq)
+            SELECT c.id_clean_post
+            FROM {SCHEMA}.clean_posts c
+            JOIN {SCHEMA}.raw_posts r ON r.id_raw_post = c.id_raw_post,
+                 q
+            WHERE c.drop_reason IS NULL AND c.is_duplicate = FALSE
+              AND to_tsvector('russian',
+                    coalesce(r.title,'') || ' ' || coalesce(c.clean_content,'')) @@ q.tsq
+            ORDER BY ts_rank_cd(
+                to_tsvector('russian',
+                    coalesce(r.title,'') || ' ' || coalesce(c.clean_content,'')), q.tsq) DESC
+            LIMIT %s
+            """,
+            (tsquery, limit),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def rrf_fuse(ranked_lists: list[list[int]], k_const: int = 60) -> list[int]:
+    """Reciprocal Rank Fusion: score(d) = sum 1/(k + rank_i(d)).
+
+    Сливает ранжирования, не требуя сопоставимости их оценок: косинусное
+    расстояние и ts_rank живут в разных шкалах, складывать их напрямую
+    нельзя. RRF смотрит только на позиции.
+
+    Практическое следствие для нашей задачи: не нужно вручную решать, какому
+    объекту какой канал подходит. Замер показал, что ключевые слова точны на
+    брендах, а вектор -- на понятиях; при слиянии документ, уверенно поднятый
+    хотя бы одним каналом, оказывается наверху сам.
+    """
+    scores: dict[int, float] = {}
+    for lst in ranked_lists:
+        for rank, doc_id in enumerate(lst, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k_const + rank)
+    return [doc_id for doc_id, _ in sorted(scores.items(), key=lambda kv: -kv[1])]
 
 
 def set_ef_search(conn, ef_search: int) -> None:
@@ -292,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    {name:<16} recall {value:5.1%}   поднято документов: {len(hits)}")
 
             # 2. Три формы запроса через вектор.
+            vector_ranked_by_form: dict[str, list[int]] = {}
             for form in ("name", "aliases", "description"):
                 text = queries[form]
                 vector = embed_v5.openrouter_embed(
@@ -300,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                     base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
                 )[0]
                 ranked = vector_hits(conn, embed_v5.vector_literal(vector), max_k)
+                vector_ranked_by_form[form] = ranked
                 per_k = {}
                 for k in sorted(args.ks):
                     value = recall(set(ranked[:k]), positives)
@@ -308,41 +380,33 @@ def main(argv: list[str] | None = None) -> int:
                 cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
                 print(f"    vector:{form:<9} {cells}")
 
-            # 2a. HyDE: вымышленная новость про объект вместо описания
-            # объекта. Замер показал, что чем ближе форма запроса к тексту
-            # новости, тем выше recall; HyDE доводит это до предела -- запрос
-            # строится сразу в пространстве документов.
-            # Три регистра меряются по отдельности: вектор кодирует не только
-            # смысл, но и стиль, а корпус неоднороден (61% телеграм). Если
-            # регистры дадут близкий recall -- чувствительность к формату для
-            # этого корпуса несущественна. Если разойдутся -- ответом будет
-            # объединение регистров, оно считается тут же при равном бюджете.
-            if object_id in HYDE:
-                registers = HYDE[object_id]
-                hyde_ranked: dict[str, list[int]] = {}
-                for reg, text in registers.items():
-                    vector = embed_v5.openrouter_embed(
-                        [text], api_key=api_key,
-                        model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
-                        base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
-                    )[0]
-                    ranked = vector_hits(conn, embed_v5.vector_literal(vector), max_k)
-                    hyde_ranked[reg] = ranked
-                    per_k = {k: recall(set(ranked[:k]), positives) for k in sorted(args.ks)}
-                    row["methods"][f"vector:hyde:{reg}"] = {"recall_at_k": per_k}
-                    cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
-                    print(f"    hyde:{reg:<12}{cells}")
+            # 2c. Гибрид: лексический канал + векторный, слитые через RRF.
+            #
+            # Это ответ на то, что замер показал ранее: ключевые слова точны
+            # на объектах-строках, вектор -- на объектах-понятиях. Раньше из
+            # этого следовало «выбирать канал руками по типу объекта», что
+            # само по себе полукостыль. RRF снимает выбор: оба канала дают
+            # своё ранжирование, документ, уверенно поднятый любым из них,
+            # выходит наверх, и разделять объекты на типы не требуется.
+            tsq = build_tsquery(queries["aliases"])
+            lex_ranked = lexical_hits(conn, tsq, max_k)
+            per_k = {k: recall(set(lex_ranked[:k]), positives) for k in sorted(args.ks)}
+            row["methods"]["лексический (FTS)"] = {"recall_at_k": per_k,
+                                                   "returned": len(lex_ranked)}
+            cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
+            print(f"    лексический      {cells}   (поднято {len(lex_ranked)})")
 
-                per_k = {}
-                for k in sorted(args.ks):
-                    share = max(1, k // len(hyde_ranked))
-                    union_reg: set[int] = set()
-                    for lst in hyde_ranked.values():
-                        union_reg |= set(lst[:share])
-                    per_k[k] = recall(union_reg, positives)
-                row["methods"]["vector:hyde:все регистры"] = {"recall_at_k": per_k}
-                cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
-                print(f"    hyde:объединение {cells}   (равный бюджет)")
+            best_vec_form = max(
+                ("name", "aliases", "description"),
+                key=lambda f: row["methods"][f"vector:{f}"]["recall_at_k"][max_k],
+            )
+            vec_ranked = vector_ranked_by_form[best_vec_form]
+            fused = rrf_fuse([lex_ranked, vec_ranked])
+            per_k = {k: recall(set(fused[:k]), positives) for k in sorted(args.ks)}
+            row["methods"][f"гибрид RRF (FTS + vector:{best_vec_form})"] = {
+                "recall_at_k": per_k}
+            cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
+            print(f"    гибрид RRF       {cells}   (FTS + vector:{best_vec_form})")
 
             # 2b. Мультизапрос: несколько запросов по граням объекта,
             # выдачи объединяются. Один вектор не может лежать одновременно
