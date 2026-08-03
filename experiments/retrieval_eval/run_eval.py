@@ -64,6 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, "/root/.openclaw/workspace/agents/agent_1/src")
 
 from patterns import OBJECT_PATTERNS, to_postgres  # noqa: E402
+from queries import HYDE, MULTI_QUERIES, QUERIES  # noqa: E402,F401
 
 SCHEMA = "agent_1_v5"
 DEFAULT_ENV = Path("/root/.openclaw/workspace/agents/agent_1/.env")
@@ -72,58 +73,6 @@ DEFAULT_KS = (10, 50, 100, 500)
 # Вторая ось эксперимента: чем представлен запрос. Три формы одного и того
 # же объекта -- это и есть измеряемая переменная, поэтому они выписаны
 # здесь явно, а не собираются из чужих структур.
-QUERIES: dict[int, dict[str, str]] = {
-    1: {
-        "name": "GigaChat",
-        "aliases": "GigaChat ГигаЧат Гигачат Гигачад гига нейросеть Сбера Кандинский Kandinsky",
-        "description": "Новости о GigaChat — генеративной нейросети Сбера: запуск функций, обновления моделей, партнёрства, применение в продуктах, а также о Кандинском для генерации изображений.",
-    },
-    2: {
-        "name": "YandexGPT и Алиса",
-        "aliases": "YandexGPT ЯндексГПТ YaGPT Алиса AI Яндекс Нейро Yandex Cloud ML",
-        "description": "Новости об ИИ-продуктах Яндекса: языковой модели YandexGPT, голосовом помощнике Алиса, нейропоиске и облачных ML-сервисах Яндекса.",
-    },
-    3: {
-        "name": "Open-source модели для self-hosting",
-        "aliases": "DeepSeek Qwen Llama Mistral открытые модели open-source LLM",
-        "description": "Новости об открытых языковых моделях, которые можно развернуть на своей инфраструктуре: DeepSeek, Qwen, Llama, Mistral — релизы, лицензии, сравнения с закрытыми моделями.",
-    },
-    4: {
-        "name": "OpenAI и ChatGPT",
-        "aliases": "OpenAI ChatGPT GPT-4 GPT-5 Sora Anthropic Claude чат-гпт",
-        "description": "Новости о глобальных лидерах генеративного ИИ: OpenAI и ChatGPT, Anthropic и Claude — релизы моделей, расследования и иски, ограничения доступа, конкуренция.",
-    },
-    5: {
-        "name": "Доверие к ИИ",
-        "aliases": "доверие к ИИ страх ИИ восприятие нейросетей хайп вокруг ИИ",
-        "description": "Новости об отношении общества к искусственному интеллекту: доверие и недоверие, страхи и скепсис, недовольство ИИ-продуктами, опросы о восприятии нейросетей.",
-    },
-    6: {
-        "name": "Регуляторика ИИ",
-        "aliases": "закон об ИИ регулирование ИИ маркировка ИИ-контента ГОСТ ИИ AI Act персональные данные",
-        "description": "Новости о государственном регулировании искусственного интеллекта: законопроекты, обязательная маркировка ИИ-контента, требования к персональным данным, стандарты и запреты.",
-    },
-    7: {
-        "name": "GPU и вычислительные мощности",
-        "aliases": "GPU видеокарты дефицит чипов дата-центры ИИ Nvidia вычислительные мощности",
-        "description": "Новости о железе для искусственного интеллекта: графические ускорители и ИИ-чипы, память, дефицит и поставки, строительство и стоимость дата-центров под ИИ-нагрузку.",
-    },
-    8: {
-        "name": "Корпоративное внедрение GenAI",
-        "aliases": "внедрение ИИ в бизнесе enterprise AI ИИ на предприятии цифровизация",
-        "description": "Новости о применении генеративного ИИ в компаниях и на производстве: внедрения в отраслях, корпоративные платформы, автоматизация процессов, эффекты для бизнеса.",
-    },
-    9: {
-        "name": "Лидеры мнений в теме ИИ",
-        "aliases": "эксперты по ИИ ИИ-инфлюенсеры евангелисты ИИ AI-блогеры",
-        "description": "Публичные высказывания экспертов и лидеров мнений об искусственном интеллекте: прогнозы, оценки влияния нейросетей на профессии и рынок, интервью специалистов.",
-    },
-    10: {
-        "name": "Инциденты и безопасность GenAI",
-        "aliases": "утечки ИИ галлюцинации нейросети дипфейк запрет ИИ сбой нейросети",
-        "description": "Новости о происшествиях вокруг генеративного ИИ: утечки данных, галлюцинации моделей, дипфейки и мошенничество с использованием нейросетей, сбои и блокировки.",
-    },
-}
 
 
 def load_dotenv(path: Path) -> None:
@@ -359,6 +308,52 @@ def main(argv: list[str] | None = None) -> int:
                 cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
                 print(f"    vector:{form:<9} {cells}")
 
+            # 2a. HyDE: вымышленная новость про объект вместо описания
+            # объекта. Замер показал, что чем ближе форма запроса к тексту
+            # новости, тем выше recall; HyDE доводит это до предела -- запрос
+            # строится сразу в пространстве документов.
+            if object_id in HYDE:
+                vector = embed_v5.openrouter_embed(
+                    [HYDE[object_id]], api_key=api_key,
+                    model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
+                    base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
+                )[0]
+                ranked = vector_hits(conn, embed_v5.vector_literal(vector), max_k)
+                per_k = {k: recall(set(ranked[:k]), positives) for k in sorted(args.ks)}
+                row["methods"]["vector:hyde"] = {"recall_at_k": per_k}
+                cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
+                print(f"    vector:hyde      {cells}")
+
+            # 2b. Мультизапрос: несколько запросов по граням объекта,
+            # выдачи объединяются. Один вектор не может лежать одновременно
+            # рядом с опросом о доверии и с протестом у дата-центра --
+            # усреднённая точка окажется между ними и рядом ни с чем.
+            #
+            # Бюджет кандидатов держится равным одиночному запросу: из
+            # каждого из n запросов берётся top-(K/n). Иначе мультизапрос
+            # выигрывал бы просто тем, что достаёт больше документов, и
+            # сравнение ничего бы не значило.
+            if object_id in MULTI_QUERIES:
+                texts = MULTI_QUERIES[object_id]
+                vectors = embed_v5.openrouter_embed(
+                    texts, api_key=api_key,
+                    model=os.environ.get("EMBED_MODEL", embed_v5.DEFAULT_MODEL),
+                    base_url=os.environ.get("OPENROUTER_BASE_URL", embed_v5.DEFAULT_BASE_URL),
+                )
+                ranked_lists = [
+                    vector_hits(conn, embed_v5.vector_literal(v), max_k) for v in vectors
+                ]
+                per_k = {}
+                for k in sorted(args.ks):
+                    share = max(1, k // len(texts))
+                    union: set[int] = set()
+                    for lst in ranked_lists:
+                        union |= set(lst[:share])
+                    per_k[k] = recall(union, positives)
+                row["methods"][f"multi×{len(texts)}"] = {"recall_at_k": per_k}
+                cells = "  ".join(f"@{k} {per_k[k]:5.1%}" for k in sorted(args.ks))
+                print(f"    multi×{len(texts):<11}{cells}   (равный бюджет)")
+
             # 3. Цепочка из архитектурной схемы банка (2026-07-31): сначала
             # семантический поиск, ЗАТЕМ фильтр по ключевым словам и
             # негатив-фильтр по отобранному. Это пересечение, а не
@@ -404,6 +399,32 @@ def main(argv: list[str] | None = None) -> int:
                 "recall": value, "returned": len(union)}
             print(f"    объединение      recall {value:5.1%}   "
                   f"(регекс ∪ vector:{best_form}@{union_k}, поднято {len(union)})")
+
+            # 5. Честная precision. По всей выдаче её посчитать нельзя:
+            # релевантность неразмеченных документов неизвестна. Но можно
+            # посчитать по размеченной части и отдельно показать, какая доля
+            # выдачи вообще не размечена. Без этого recall умалчивает о цене
+            # метода: у объекта 7 ключевые слова подняли 174 документа при 87
+            # положительных, и по одному recall этого не видно.
+            print("    точность среди размеченных (и сколько выдачи неизвестно):")
+            for name, retrieved in (
+                ("ключевые слова", regex_set),
+                (f"vector:{best_form}@{union_k}", set(ranked_best)),
+                ("объединение", union),
+            ):
+                known = retrieved & labelled_ids
+                good = retrieved & positives
+                prec = len(good) / len(known) if known else 0.0
+                unknown = len(retrieved) - len(known)
+                row["methods"].setdefault("precision", {})[name] = {
+                    "precision_among_labelled": prec,
+                    "retrieved": len(retrieved),
+                    "labelled": len(known),
+                    "unlabelled": unknown,
+                }
+                print(f"      {name:<26} {prec:5.1%}  "
+                      f"(поднято {len(retrieved)}, размечено {len(known)}, "
+                      f"неизвестно {unknown})")
 
             # --- примеры: числа без заголовков не интерпретируются ---
             vector_only = (positives & set(ranked_best)) - regex_set
