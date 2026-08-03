@@ -201,6 +201,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch", type=int, default=10, help="документов в одном запросе")
     ap.add_argument("--workers", type=int, default=4, help="параллельных запросов")
     ap.add_argument("--doc-chars", type=int, default=1200)
+    ap.add_argument("--ce-max-length", type=int, default=512,
+                    help="длина входа кросс-энкодера в токенах. Меньше -- быстрее "
+                         "нелинейно; 256 обрежет половину документов, но заголовок "
+                         "и лид останутся, а релевантность обычно видна там")
+    ap.add_argument("--ce-threads", type=int, default=None,
+                    help="потоков torch; по умолчанию все ядра")
     ap.add_argument("--exclude-objects", type=int, nargs="*", default=[])
     ap.add_argument("--min-positives", type=int, default=5)
     ap.add_argument("--relation", choices=("event", "any"), default="event")
@@ -225,10 +231,20 @@ def main(argv: list[str] | None = None) -> int:
 
     cross_encoder = None
     if args.backend == "crossenc":
+        import torch  # noqa: E402
         from sentence_transformers import CrossEncoder  # noqa: E402
 
-        print(f"Загружаю кросс-энкодер {args.model} (процессор)…")
-        cross_encoder = CrossEncoder(args.model, device="cpu", max_length=512)
+        # По умолчанию torch на сервере часто берёт одно ядро, и модель
+        # считается во столько раз медленнее, сколько ядер простаивает.
+        # Первый прогон дал 5.7 секунды на пару -- скорее всего именно из-за
+        # этого.
+        threads = args.ce_threads or (os.cpu_count() or 1)
+        torch.set_num_threads(threads)
+        print(f"Загружаю кросс-энкодер {args.model} "
+              f"(процессор, потоков {torch.get_num_threads()}, "
+              f"длина входа {args.ce_max_length})…")
+        cross_encoder = CrossEncoder(args.model, device="cpu",
+                                     max_length=args.ce_max_length)
     base_url = os.environ.get("OPENROUTER_BASE_URL", DEFAULT_BASE_URL)
 
     from agent_1 import embed_v5  # noqa: E402
