@@ -208,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="длина входа в токенах. 512 -- полное качество, 163 мин "
                          "на 8 объектов; 256 -- 93 мин; 128 оставляет заголовок и "
                          "отменяет смысл метода")
+    ap.add_argument("--rerank-query",
+                    choices=("label", "label+desc", "desc", "aliases", "question"),
+                    default="label+desc",
+                    help="как формулируется запрос ДЛЯ РЕРАНКЕРА. Не путать с "
+                         "--form: тот задаёт запрос для векторного отбора")
     ap.add_argument("--jina-tpm", type=int, default=100_000,
                     help="лимит токенов в минуту у Jina; скрипт сам держит расход "
                          "ниже него, чтобы не ловить 429")
@@ -284,7 +289,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Для crossenc на оценку влияет окно в токенах, для jina -- сколько
     # знаков документа мы отдали. В ключе должно стоять то, что влияет.
-    cache_tag = args.max_length if args.backend == "crossenc" else f"c{args.doc_chars}"
+    cache_tag = (f"{args.max_length}" if args.backend == "crossenc"
+                 else f"c{args.doc_chars}") + f":{args.rerank_query}"
 
     by_id = {p.object_id: p for p in OBJECT_PATTERNS}
     report: dict[str, Any] = {"model": args.model, "form": args.form,
@@ -313,7 +319,20 @@ def main(argv: list[str] | None = None) -> int:
             ranked = vector_hits(conn, embed_v5.vector_literal(vector), args.candidates)
             docs = fetch_docs(conn, ranked, args.doc_chars)
 
-            query_text = f"{pattern.label}. {QUERIES[object_id]['description']}"
+            # Запрос ДЛЯ РЕРАНКЕРА -- отдельная величина от запроса для
+            # векторного поиска (--form). Раньше он был жёстко зашит как
+            # "название + описание", и это, возможно, и есть причина слабых
+            # результатов кросс-энкодеров: они обучены на парах «короткий
+            # запрос -- абзац», а мета-описание само похоже на документ, и
+            # модель начинает мерить сходство текстов вместо релевантности.
+            q = QUERIES[object_id]
+            query_text = {
+                "label": pattern.label,
+                "label+desc": f"{pattern.label}. {q['description']}",
+                "desc": q["description"],
+                "aliases": q["aliases"],
+                "question": f"Относится ли эта новость к теме «{pattern.label}»?",
+            }[args.rerank_query]
             todo = [d for d in ranked if f"{object_id}:{d}:{args.model}:{cache_tag}" not in cache]
             print(f"    кандидатов {len(ranked)}, к оценке {len(todo)}")
 

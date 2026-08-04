@@ -56,6 +56,7 @@ import time
 from pathlib import Path
 
 import psycopg
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -66,6 +67,49 @@ ALT_SCHEMA = "retrieval_eval"
 DEFAULT_ENV = Path("/root/.openclaw/workspace/agents/agent_1/.env")
 DEFAULT_MODEL = "openai/text-embedding-3-large"
 EMBED_DIMS = 1024
+
+
+JINA_EMBED_URL = "https://api.jina.ai/v1/embeddings"
+
+
+def jina_embed(texts: list[str], *, api_key: str, model: str, task: str) -> list[list[float]]:
+    """Эмбеддинги Jina с указанием роли текста.
+
+    Ключевое отличие от `text-embedding-3`: у модели РАЗНЫЕ режимы для
+    запроса и для документа -- `retrieval.query` и `retrieval.passage`. Она
+    обучена на парах «короткая фраза -- длинный текст», то есть закрывает
+    ровно тот разрыв, который мы весь эксперимент обходили переписыванием
+    запроса. Симметричная модель такого различия не делает вовсе.
+
+    Роль обязана быть правильной: документы, закодированные как запросы,
+    окажутся в другой области пространства, и поиск сломается молча.
+    """
+    body = {"model": model, "input": texts, "task": task,
+            "dimensions": EMBED_DIMS}
+    last: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            resp = requests.post(
+                JINA_EMBED_URL,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json=body, timeout=180,
+            )
+            if resp.status_code in (401, 402, 403):
+                raise SystemExit(f"Jina отказала ({resp.status_code}): {resp.text[:300]}")
+            if resp.status_code == 429:
+                wait = float(resp.headers.get("Retry-After") or 20)
+                print(f"    429, жду {wait:.0f}с", flush=True)
+                time.sleep(wait)
+                continue
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+            data = sorted(resp.json()["data"], key=lambda d: d["index"])
+            return [d["embedding"] for d in data]
+        except (requests.RequestException, RuntimeError, KeyError, ValueError) as exc:
+            last = exc
+            time.sleep(3 * attempt)
+    raise RuntimeError(f"Jina не ответила: {last}")
 
 
 def load_dotenv(path: Path) -> None:
@@ -159,7 +203,11 @@ def fetch_texts(conn, ids: list[int], max_chars: int) -> list[tuple[int, str]]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Пересчёт сэмпла другим энкодером")
-    ap.add_argument("--backend", choices=("openrouter", "local"), default="openrouter")
+    ap.add_argument("--backend", choices=("jina", "openrouter", "local"), default="jina",
+                    help="jina -- jina-embeddings-v3, обучена на асимметрии "
+                         "(разные режимы для запроса и документа), процессор не "
+                         "трогает; openrouter -- модели OpenAI; local -- BGE-M3 на "
+                         "процессоре, грузит машину надолго")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--pool", type=Path, default=Path("data/pool.jsonl"))
     ap.add_argument("--sample-random", type=int, default=5000,
@@ -180,7 +228,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {args.dsn_var} не найден", file=sys.stderr)
         return 1
 
-    if args.backend == "openrouter":
+    if args.backend == "jina":
+        jina_key = os.environ.get("JINA_API_KEY", "")
+        if not jina_key:
+            print("ERROR: нет JINA_API_KEY", file=sys.stderr)
+            return 1
+        model_name = args.model if args.model != DEFAULT_MODEL else "jina-embeddings-v3"
+
+        def encode(texts: list[str], task: str = "retrieval.passage"):
+            return jina_embed(texts, api_key=jina_key, model=model_name, task=task)
+
+        args.model = model_name
+        print(f"Бэкенд jina, модель {model_name}, асимметричные режимы")
+    elif args.backend == "openrouter":
         api_key = os.environ.get("OPENROUTER_API_KEY", "")
         if not api_key:
             print("ERROR: OPENROUTER_API_KEY не найден", file=sys.stderr)
@@ -261,7 +321,12 @@ def main(argv: list[str] | None = None) -> int:
         print("Считаю векторы запросов…")
         rows = [(oid, form, text) for oid, forms in QUERIES.items()
                 for form, text in forms.items()]
-        vectors = encode([t for _, _, t in rows])
+        if args.backend == "jina":
+            # Роль запроса, а не документа: в этом весь смысл асимметричной
+            # модели, и перепутать здесь -- значит незаметно сломать поиск.
+            vectors = encode([t for _, _, t in rows], task="retrieval.query")
+        else:
+            vectors = encode([t for _, _, t in rows])
         with conn.cursor() as cur:
             for (oid, form, _), vector in zip(rows, vectors):
                 cur.execute(
