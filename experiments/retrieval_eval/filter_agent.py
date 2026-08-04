@@ -217,6 +217,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="посчитать полноту и точность по эталону")
     ap.add_argument("--labels", type=Path, default=None)
     ap.add_argument("--relation", choices=("event", "any"), default="event")
+    ap.add_argument("--sweep", action="store_true",
+                    help="перебрать параметры отсечки на одних и тех же кандидатах "
+                         "и напечатать размен полноты на точность")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--env-file", type=Path, default=DEFAULT_ENV)
     ap.add_argument("--dsn-var", default="AGENT_1_DB_DSN")
@@ -245,6 +248,9 @@ def main(argv: list[str] | None = None) -> int:
     targets = [p.object_id for p in OBJECT_PATTERNS] if args.all else [args.object]
     targets = [o for o in targets if o not in args.exclude_objects]
     by_id = {p.object_id: p for p in OBJECT_PATTERNS}
+
+    # Кандидаты собираются один раз: поиск дорогой, а перебор отсечек -- нет.
+    harvest: dict[int, tuple[list[tuple[int, float]], set[int], set[int]]] = {}
 
     report: dict[str, Any] = {"candidates": args.candidates, "min_keep": args.min_keep,
                               "max_keep": args.max_keep, "alt_model": args.alt_model,
@@ -311,7 +317,11 @@ def main(argv: list[str] | None = None) -> int:
             selected = set(by_score) | kw | set(both)
 
             # 4. Негатив-фильтр как вето.
-            vetoed = negative_hits(conn, pattern.negative or "", sorted(selected))
+            # По всем кандидатам сразу, а не только по отобранным: при
+            # переборе отсечек набор меняется, и вето не должно считаться заново.
+            vetoed_all = negative_hits(conn, pattern.negative or "",
+                                       sorted({d for d, _ in scored} | kw))
+            vetoed = vetoed_all & selected
             final = selected - vetoed
 
             print(f"    ключевые слова: {len(kw)}   вектор@{args.candidates}: {len(scored)}"
@@ -342,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
                       f"положительных {len(positives)})")
             print()
             report["objects"][str(object_id)] = row_out
+            harvest[object_id] = (scored, kw, vetoed_all)
 
     if args.evaluate and report["objects"]:
         rows = [r for r in report["objects"].values() if "recall" in r]
@@ -357,6 +368,41 @@ def main(argv: list[str] | None = None) -> int:
                   f"{sum(r['recall'] for r in rows)/len(rows):>9.1%} "
                   f"{sum(r['precision'] for r in rows)/len(rows):>9.1%} "
                   f"{sum(r['ceiling'] for r in rows)/len(rows):>9.1%}   среднее")
+
+
+    if args.sweep and harvest and truth:
+        print("=== Размен полноты на точность ===")
+        print("Кандидаты одни и те же, меняются только параметры отсечки.")
+        print()
+        print(f"{'min_keep':>8} {'max_keep':>8} {'min_ratio':>9} | "
+              f"{'отобрано':>9} {'полнота':>8} {'точность':>9}")
+        grid = [(mk, xk, mr)
+                for mk in (20, 50, 100)
+                for xk in (200, 300, 500)
+                for mr in (3.0, 10.0, 1e9)]
+        for mk, xk, mr in grid:
+            tot_sel = tot_rec = tot_prec = 0.0
+            n = 0
+            for object_id, (scored, kw, vetoed_all) in harvest.items():
+                positives = truth.get(object_id)
+                if not positives:
+                    continue
+                cut = adaptive_cutoff([s for _, s in scored], min_keep=mk,
+                                      max_keep=xk, min_ratio=mr)
+                sel = ({d for d, _ in scored[:cut]} | kw) - vetoed_all
+                found = sel & positives
+                tot_sel += len(sel)
+                tot_rec += len(found) / len(positives)
+                tot_prec += len(found) / len(sel) if sel else 0.0
+                n += 1
+            if not n:
+                continue
+            ratio_label = "нет" if mr > 1e8 else f"{mr:.0f}"
+            print(f"{mk:>8} {xk:>8} {ratio_label:>9} | {tot_sel/n:>9.0f} "
+                  f"{tot_rec/n:>8.1%} {tot_prec/n:>9.1%}")
+        print()
+        print("min_ratio «нет» -- обрыв не засчитывается никогда, "
+              "то есть берём ровно до потолка.")
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
