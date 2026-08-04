@@ -20,27 +20,26 @@
 найти то, чего первый этап не принёс: вне топ-N для него ничего не
 существует.
 
-## Почему остался только он
+## Два бэкенда
 
-Пробовали три варианта. LLM через OpenRouter работала и давала хороший
-прирост (+18 пунктов на объекте 6 при глубине 50), но каждый прогон стоит
-денег, оценки плавают от запуска к запуску, и кредиты кончились посреди
-замера. Jina по API -- настоящий кросс-энкодер на чужом GPU, но это чужой
-ключ и чужие лимиты.
+`--backend jina` (по умолчанию) -- кросс-энкодер `jina-reranker-v3` по API,
+на их GPU. Бесплатный лимит в 10 млн токенов, наш процессор не трогает
+вообще. Контекст 131 тысяча токенов, поэтому документ можно отдавать
+целиком, не обрезая до 1200 знаков, как приходится локальной модели.
+Нужен ключ в JINA_API_KEY.
 
-Локальный кросс-энкодер медленный, зато бесплатный, детерминированный и ни
-от кого не зависит: одинаковый вход всегда даёт одинаковый выход, и
-повторный замер не сдвинется сам по себе. Для эксперимента, где мы ловим
-разницу в три-пять пунктов, второе не менее важно первого.
+`--backend crossenc` -- локальный `bge-reranker-v2-m3`. **Грузит процессор
+надолго**, поэтому по умолчанию берёт половину ядер, а не все: полный
+прогон занимает часы, и в это время машина занята не только нами. Замер
+`bench_reranker.py` на шести ядрах: 6.11 с/пара при 512 токенах (163 минуты
+на 8 объектов), 3.50 при 256 (93 минуты), 1.72 при 128 (46 минут, но 128
+токенов оставляет заголовок и отменяет смысл метода).
 
-Скорость по `bench_reranker.py` на этой машине (6 ядер):
-
-    длина 512 -- 6.11 с/пара -- 163 минуты на 8 объектов по 200 кандидатов
-    длина 256 -- 3.50 с/пара --  93 минуты
-    длина 128 -- 1.72 с/пара --  46 минут
-
-128 токенов оставляет примерно заголовок и первую строку, то есть отменяет
-смысл метода. 256 -- разумный компромисс, 512 -- полное качество.
+Что уже известно по числам. LLM через OpenRouter давала +11.6 пункта в
+среднем при глубине 100, до +18 на отдельных объектах. Локальный
+кросс-энкодер на 256 токенах -- всего +1.4, а на объекте 3 ухудшал порядок
+на 9 пунктов. Jina не мерена ни разу: другая модель, другое поведение
+ожидаемо, но это ожидание, а не результат.
 
 ## Как читать результат
 
@@ -53,6 +52,7 @@
 Оценки кэшируются, повторный запуск досчитывает недостающее.
 
     python rerank_eval.py --labels data/labels_v2.jsonl --exclude-objects 9
+    python rerank_eval.py --labels ... --backend crossenc --threads 2
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, "/root/.openclaw/workspace/agents/agent_1/src")
@@ -77,7 +78,47 @@ from run_eval import (  # noqa: E402
 )
 
 DEFAULT_ENV = Path("/root/.openclaw/workspace/agents/agent_1/.env")
-DEFAULT_MODEL = "BAAI/bge-reranker-v2-m3"
+DEFAULT_CE_MODEL = "BAAI/bge-reranker-v2-m3"
+DEFAULT_JINA_MODEL = "jina-reranker-v3"
+JINA_URL = "https://api.jina.ai/v1/rerank"
+REQUEST_TIMEOUT = 180
+RETRIES = 4
+
+
+def jina_rerank(query: str, documents: list[str], *, api_key: str,
+                model: str) -> list[float]:
+    """Оценки от Jina в порядке переданных документов.
+
+    Ответ приходит отсортированным по релевантности, с полем `index` --
+    позицией во входном списке. Раскладываем обратно по исходному порядку:
+    сортировкой занимается вызывающий код, и делать её в двух местах -- верный
+    способ перепутать.
+    """
+    body = {"model": model, "query": query, "documents": documents,
+            "top_n": len(documents)}
+    last: Exception | None = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            resp = requests.post(
+                JINA_URL,
+                headers={"Authorization": f"Bearer {api_key}",
+                         "Content-Type": "application/json"},
+                json=body, timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code in (401, 402, 403, 429):
+                # Ключ, лимит или квота -- повторять бессмысленно.
+                raise SystemExit(f"Jina отказала ({resp.status_code}): {resp.text[:300]}")
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+            scores = [0.0] * len(documents)
+            for item in resp.json()["results"]:
+                scores[int(item["index"])] = float(item["relevance_score"])
+            return scores
+        except (requests.RequestException, RuntimeError, KeyError, ValueError) as exc:
+            last = exc
+            if attempt < RETRIES:
+                time.sleep(3 * attempt)
+    raise RuntimeError(f"Jina не ответила после {RETRIES} попыток: {last}")
 
 
 def fetch_docs(conn, ids: list[int], chars: int) -> dict[int, tuple[str, str]]:
@@ -104,25 +145,40 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--labels", type=Path, required=True)
     ap.add_argument("--out", type=Path, default=Path("data/rerank_report.json"))
     ap.add_argument("--cache", type=Path, default=Path("data/rerank_cache.jsonl"))
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--backend", choices=("jina", "crossenc"), default="jina",
+                    help="jina -- по API на их GPU, бесплатный лимит, процессор "
+                         "не трогает; crossenc -- локально, грузит CPU часами")
+    ap.add_argument("--model", default=None,
+                    help="по умолчанию jina-reranker-v3 либо BAAI/bge-reranker-v2-m3")
     ap.add_argument("--form", choices=("name", "aliases", "description"),
                     default="description", help="форма запроса для первого этапа")
     ap.add_argument("--candidates", type=int, default=200,
                     help="сколько документов первый этап отдаёт реранкеру")
-    ap.add_argument("--batch", type=int, default=16, help="пар в одном вызове модели")
-    ap.add_argument("--doc-chars", type=int, default=1200)
+    ap.add_argument("--batch", type=int, default=None,
+                    help="документов в одном вызове: 50 для jina, 16 для crossenc")
+    ap.add_argument("--doc-chars", type=int, default=None,
+                    help="знаков текста на документ: 6000 для jina (контекст "
+                         "131k позволяет), 1200 для crossenc (окно 512 токенов)")
     ap.add_argument("--max-length", type=int, default=512,
                     help="длина входа в токенах. 512 -- полное качество, 163 мин "
                          "на 8 объектов; 256 -- 93 мин; 128 оставляет заголовок и "
                          "отменяет смысл метода")
     ap.add_argument("--threads", type=int, default=None,
-                    help="потоков torch; по умолчанию все ядра")
+                    help="потоков torch для crossenc. По умолчанию ПОЛОВИНА ядер: "
+                         "прогон идёт часами, и занимать машину целиком нельзя")
     ap.add_argument("--exclude-objects", type=int, nargs="*", default=[])
     ap.add_argument("--min-positives", type=int, default=5)
     ap.add_argument("--relation", choices=("event", "any"), default="event")
     ap.add_argument("--env-file", type=Path, default=DEFAULT_ENV)
     ap.add_argument("--dsn-var", default="AGENT_1_DB_DSN")
     args = ap.parse_args(argv)
+
+    if args.model is None:
+        args.model = DEFAULT_JINA_MODEL if args.backend == "jina" else DEFAULT_CE_MODEL
+    if args.batch is None:
+        args.batch = 50 if args.backend == "jina" else 16
+    if args.doc_chars is None:
+        args.doc_chars = 6000 if args.backend == "jina" else 1200
 
     load_dotenv(args.env_file)
     dsn = os.environ.get(args.dsn_var)
@@ -137,16 +193,30 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
 
-    import torch  # noqa: E402
-    from sentence_transformers import CrossEncoder  # noqa: E402
-
     from agent_1 import embed_v5  # noqa: E402
 
-    threads = args.threads or (os.cpu_count() or 1)
-    torch.set_num_threads(threads)
-    print(f"Модель {args.model}, потоков {torch.get_num_threads()}, "
-          f"длина входа {args.max_length}")
-    model = CrossEncoder(args.model, device="cpu", max_length=args.max_length)
+    jina_key = os.environ.get("JINA_API_KEY", "")
+    model = None
+    if args.backend == "jina":
+        if not jina_key:
+            print("ERROR: нет JINA_API_KEY", file=sys.stderr)
+            return 1
+        print(f"Бэкенд jina, модель {args.model}, "
+              f"документ до {args.doc_chars} знаков")
+    else:
+        import torch  # noqa: E402
+        from sentence_transformers import CrossEncoder  # noqa: E402
+
+        # Половина ядер, а не все: прогон идёт часами, и оставить машину без
+        # процессора на это время нельзя.
+        cores = os.cpu_count() or 1
+        threads = args.threads or max(1, cores // 2)
+        torch.set_num_threads(threads)
+        print(f"Бэкенд crossenc, модель {args.model}, "
+              f"потоков {torch.get_num_threads()} из {cores}, "
+              f"длина входа {args.max_length}")
+        print("ВНИМАНИЕ: локальный прогон надолго займёт процессор.")
+        model = CrossEncoder(args.model, device="cpu", max_length=args.max_length)
 
     truth, _ = load_truth(args.labels, args.min_positives, args.relation)
     for oid in args.exclude_objects:
@@ -159,6 +229,10 @@ def main(argv: list[str] | None = None) -> int:
                 row = json.loads(line)
                 cache[row["key"]] = row["score"]
         print(f"Кэш оценок: {len(cache)}")
+
+    # Для crossenc на оценку влияет окно в токенах, для jina -- сколько
+    # знаков документа мы отдали. В ключе должно стоять то, что влияет.
+    cache_tag = args.max_length if args.backend == "crossenc" else f"c{args.doc_chars}"
 
     by_id = {p.object_id: p for p in OBJECT_PATTERNS}
     report: dict[str, Any] = {"model": args.model, "form": args.form,
@@ -186,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
             docs = fetch_docs(conn, ranked, args.doc_chars)
 
             query_text = f"{pattern.label}. {QUERIES[object_id]['description']}"
-            todo = [d for d in ranked if f"{object_id}:{d}:{args.model}:{args.max_length}" not in cache]
+            todo = [d for d in ranked if f"{object_id}:{d}:{args.model}:{cache_tag}" not in cache]
             print(f"    кандидатов {len(ranked)}, к оценке {len(todo)}")
 
             started = time.time()
@@ -196,9 +270,13 @@ def main(argv: list[str] | None = None) -> int:
                 for doc_id in batch:
                     title, text = docs.get(doc_id, ("", ""))
                     pairs.append([query_text, f"{title}. {text}"])
-                scores = model.predict(pairs, show_progress_bar=False)
+                if args.backend == "jina":
+                    scores = jina_rerank(query_text, [d for _, d in pairs],
+                                         api_key=jina_key, model=args.model)
+                else:
+                    scores = model.predict(pairs, show_progress_bar=False)
                 for doc_id, value in zip(batch, scores):
-                    key = f"{object_id}:{doc_id}:{args.model}:{args.max_length}"
+                    key = f"{object_id}:{doc_id}:{args.model}:{cache_tag}"
                     cache[key] = float(value)
                     cache_fh.write(json.dumps({"key": key, "score": float(value)}) + "\n")
                 cache_fh.flush()
@@ -212,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
             # Документы без оценки уходят в конец с сохранением исходного
             # порядка: молча выбрасывать их нельзя -- это была бы потеря
             # recall, замаскированная под работу реранкера.
-            scored = [(d, cache.get(f"{object_id}:{d}:{args.model}:{args.max_length}")) for d in ranked]
+            scored = [(d, cache.get(f"{object_id}:{d}:{args.model}:{cache_tag}")) for d in ranked]
             missing = [d for d, s in scored if s is None]
             reranked = [d for d, _ in sorted(
                 ((d, s) for d, s in scored if s is not None),
