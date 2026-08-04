@@ -186,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
             docs = fetch_docs(conn, ranked, args.doc_chars)
 
             query_text = f"{pattern.label}. {QUERIES[object_id]['description']}"
-            todo = [d for d in ranked if f"{object_id}:{d}:{args.model}" not in cache]
+            todo = [d for d in ranked if f"{object_id}:{d}:{args.model}:{args.max_length}" not in cache]
             print(f"    кандидатов {len(ranked)}, к оценке {len(todo)}")
 
             started = time.time()
@@ -198,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
                     pairs.append([query_text, f"{title}. {text}"])
                 scores = model.predict(pairs, show_progress_bar=False)
                 for doc_id, value in zip(batch, scores):
-                    key = f"{object_id}:{doc_id}:{args.model}"
+                    key = f"{object_id}:{doc_id}:{args.model}:{args.max_length}"
                     cache[key] = float(value)
                     cache_fh.write(json.dumps({"key": key, "score": float(value)}) + "\n")
                 cache_fh.flush()
@@ -212,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             # Документы без оценки уходят в конец с сохранением исходного
             # порядка: молча выбрасывать их нельзя -- это была бы потеря
             # recall, замаскированная под работу реранкера.
-            scored = [(d, cache.get(f"{object_id}:{d}:{args.model}")) for d in ranked]
+            scored = [(d, cache.get(f"{object_id}:{d}:{args.model}:{args.max_length}")) for d in ranked]
             missing = [d for d, s in scored if s is None]
             reranked = [d for d, _ in sorted(
                 ((d, s) for d, s in scored if s is not None),
