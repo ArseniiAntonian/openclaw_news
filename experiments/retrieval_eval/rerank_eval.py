@@ -82,11 +82,48 @@ DEFAULT_CE_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_JINA_MODEL = "jina-reranker-v3"
 JINA_URL = "https://api.jina.ai/v1/rerank"
 REQUEST_TIMEOUT = 180
-RETRIES = 4
+RETRIES = 6
+
+
+class TokenPacer:
+    """Держит расход под лимитом токенов в минуту.
+
+    У Jina 100 000 токенов в минуту. Превышение возвращает 429, и это
+    временный отказ: ждать помогает, повторять сразу -- нет. Поэтому лимит
+    соблюдается ДО отправки, а не ловится по факту: считаем, сколько токенов
+    ушло за последние 60 секунд, и если очередной запрос не влезает --
+    спим ровно столько, чтобы старые записи вышли из окна.
+
+    Оценка токенов грубая, по числу знаков. Для русского примерно три знака
+    на токен; берём с запасом, потому что недооценка приводит к 429, а
+    переоценка -- всего лишь к лишней паузе.
+    """
+
+    def __init__(self, tokens_per_minute: int) -> None:
+        self.limit = tokens_per_minute
+        self.window: list[tuple[float, int]] = []
+
+    @staticmethod
+    def estimate(texts: list[str]) -> int:
+        return sum(len(t) for t in texts) // 3 + 50
+
+    def wait_for(self, tokens: int) -> None:
+        while True:
+            now = time.time()
+            self.window = [(t, n) for t, n in self.window if now - t < 60]
+            used = sum(n for _, n in self.window)
+            if used + tokens <= self.limit * 0.9 or not self.window:
+                self.window.append((now, tokens))
+                return
+            oldest = self.window[0][0]
+            sleep_for = max(1.0, 60 - (now - oldest) + 0.5)
+            print(f"      пауза {sleep_for:.0f}с: в окне {used} токенов из {self.limit}",
+                  flush=True)
+            time.sleep(sleep_for)
 
 
 def jina_rerank(query: str, documents: list[str], *, api_key: str,
-                model: str) -> list[float]:
+                model: str, pacer: "TokenPacer") -> list[float]:
     """Оценки от Jina в порядке переданных документов.
 
     Ответ приходит отсортированным по релевантности, с полем `index` --
@@ -96,6 +133,7 @@ def jina_rerank(query: str, documents: list[str], *, api_key: str,
     """
     body = {"model": model, "query": query, "documents": documents,
             "top_n": len(documents)}
+    pacer.wait_for(TokenPacer.estimate(documents + [query]))
     last: Exception | None = None
     for attempt in range(1, RETRIES + 1):
         try:
@@ -105,9 +143,16 @@ def jina_rerank(query: str, documents: list[str], *, api_key: str,
                          "Content-Type": "application/json"},
                 json=body, timeout=REQUEST_TIMEOUT,
             )
-            if resp.status_code in (401, 402, 403, 429):
-                # Ключ, лимит или квота -- повторять бессмысленно.
+            if resp.status_code in (401, 402, 403):
+                # Ключ или исчерпанная квота -- повторять бессмысленно.
                 raise SystemExit(f"Jina отказала ({resp.status_code}): {resp.text[:300]}")
+            if resp.status_code == 429:
+                # Лимит скорости -- временный: ждём и повторяем. Это НЕ то же
+                # самое, что 402: квота не кончилась, кончилась минута.
+                wait = float(resp.headers.get("Retry-After") or 20)
+                print(f"      429 от Jina, жду {wait:.0f}с", flush=True)
+                time.sleep(wait)
+                continue
             if resp.status_code >= 400:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
             scores = [0.0] * len(documents)
@@ -163,6 +208,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="длина входа в токенах. 512 -- полное качество, 163 мин "
                          "на 8 объектов; 256 -- 93 мин; 128 оставляет заголовок и "
                          "отменяет смысл метода")
+    ap.add_argument("--jina-tpm", type=int, default=100_000,
+                    help="лимит токенов в минуту у Jina; скрипт сам держит расход "
+                         "ниже него, чтобы не ловить 429")
     ap.add_argument("--threads", type=int, default=None,
                     help="потоков torch для crossenc. По умолчанию ПОЛОВИНА ядер: "
                          "прогон идёт часами, и занимать машину целиком нельзя")
@@ -176,9 +224,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.model is None:
         args.model = DEFAULT_JINA_MODEL if args.backend == "jina" else DEFAULT_CE_MODEL
     if args.batch is None:
-        args.batch = 50 if args.backend == "jina" else 16
+        # 20 документов по 3000 знаков -- около 20 тысяч токенов на запрос,
+        # пятая часть минутного лимита. Прежние 50 по 6000 давали сто тысяч,
+        # то есть весь лимит одним запросом, и 429 приходил сразу.
+        args.batch = 20 if args.backend == "jina" else 16
     if args.doc_chars is None:
-        args.doc_chars = 6000 if args.backend == "jina" else 1200
+        args.doc_chars = 3000 if args.backend == "jina" else 1200
 
     load_dotenv(args.env_file)
     dsn = os.environ.get(args.dsn_var)
@@ -202,7 +253,8 @@ def main(argv: list[str] | None = None) -> int:
             print("ERROR: нет JINA_API_KEY", file=sys.stderr)
             return 1
         print(f"Бэкенд jina, модель {args.model}, "
-              f"документ до {args.doc_chars} знаков")
+              f"документ до {args.doc_chars} знаков, "
+              f"лимит {args.jina_tpm} токенов/мин")
     else:
         import torch  # noqa: E402
         from sentence_transformers import CrossEncoder  # noqa: E402
@@ -239,6 +291,8 @@ def main(argv: list[str] | None = None) -> int:
                               "candidates": args.candidates,
                               "max_length": args.max_length, "objects": {}}
 
+    pacer = TokenPacer(args.jina_tpm)
+
     args.cache.parent.mkdir(parents=True, exist_ok=True)
     cache_fh = args.cache.open("a", encoding="utf-8")
 
@@ -272,7 +326,8 @@ def main(argv: list[str] | None = None) -> int:
                     pairs.append([query_text, f"{title}. {text}"])
                 if args.backend == "jina":
                     scores = jina_rerank(query_text, [d for _, d in pairs],
-                                         api_key=jina_key, model=args.model)
+                                         api_key=jina_key, model=args.model,
+                                         pacer=pacer)
                 else:
                     scores = model.predict(pairs, show_progress_bar=False)
                 for doc_id, value in zip(batch, scores):
