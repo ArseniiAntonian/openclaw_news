@@ -169,7 +169,15 @@ def call_openclaw(
         args.extend(["--thinking", config.thinking])
 
     timeout = None if config.agent_timeout == 0 else config.agent_timeout + 60
-    completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout)
+    try:
+        completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # Найдено при разборе прода 2026-08-07: subprocess.run(timeout=...)
+        # кидает TimeoutExpired, а не ScoringError/AgentCapacityError --
+        # без этого перевода завис openclaw-вызов ронял бы весь прогон
+        # ровно как непойманное исключение (та же грабля, что чинили в
+        # score_candidates, только на уровень ниже).
+        raise ScoringError(f"openclaw call timed out after {timeout}s") from exc
     if completed.returncode != 0:
         stderr = completed.stderr.strip()
         stdout = completed.stdout.strip()

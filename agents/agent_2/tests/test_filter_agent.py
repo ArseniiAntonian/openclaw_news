@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ from agent_2.llm_scoring import (  # noqa: E402
     ScoringError,
     _is_capacity_error_detail,
     _parse_retry_after_seconds,
+    call_openclaw,
     fetch_cached_scores,
     parse_batch_score_response,
     parse_score_response,
@@ -137,6 +139,21 @@ class ScoringResponseTests(unittest.TestCase):
         raw = json.dumps({"scores": [{"id_clean_post": 101, "score": 8}]})
         with self.assertRaises(Exception):
             parse_batch_score_response(raw, {101, 102})
+
+
+class CallOpenclawTimeoutTests(unittest.TestCase):
+    """Найдено при разборе прода 2026-08-07: subprocess.run(timeout=...)
+    поднимает TimeoutExpired -- отдельный от ScoringError тип, который
+    ничем не ловился и уронил бы весь прогон, если бы openclaw завис."""
+
+    def test_timeout_expired_becomes_scoring_error(self) -> None:
+        config = ScoringConfig(openclaw_cmd="openclaw", agent_id="agent_2", agent_timeout=1)
+        with patch(
+            "agent_2.llm_scoring.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="openclaw", timeout=61),
+        ):
+            with self.assertRaises(ScoringError):
+                call_openclaw("prompt", "session-key", config=config)
 
 
 class CapacityErrorDetectionTests(unittest.TestCase):
