@@ -90,6 +90,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--env-file", type=Path, default=DEFAULT_ENV)
     ap.add_argument("--dsn-var", default="AGENT_1_DB_DSN")
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument(
+        "--only-objects", default=None,
+        help="список id объектов через запятую -- прогнать только их за "
+             "этот вызов (например, при повторных обрывах процесса извне: "
+             "меньше объектов за раз -- меньше потерь на один обрыв). "
+             "Кэш LLM-оценок общий для всех вызовов, повторный запуск с "
+             "теми же id продолжит с места обрыва.",
+    )
     args = ap.parse_args(argv)
 
     if not args.labels.is_file():
@@ -104,8 +112,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     truth = load_truth(args.labels, args.relation)
+    if args.only_objects:
+        wanted = {int(x) for x in args.only_objects.split(",") if x.strip()}
+        truth = {oid: positives for oid, positives in truth.items() if oid in wanted}
+        missing = wanted - set(truth)
+        if missing:
+            print(f"WARNING: в эталоне нет объектов {sorted(missing)}", file=sys.stderr)
+        print(f"--only-objects: обрабатываю {sorted(truth)} из эталона "
+              f"({len(truth)} объект(ов)) -- отчёт будет частичным", file=sys.stderr)
     if not truth:
-        print("ERROR: эталон пуст", file=sys.stderr)
+        print("ERROR: эталон пуст (или --only-objects не совпал ни с чем)", file=sys.stderr)
         return 1
 
     scoring_config = ScoringConfig(
