@@ -95,27 +95,77 @@ pip install -r requirements.txt
 
 ## 6. Прогон регрессионного теста
 
+### ВАЖНО: запускать только durable-раннером, не из execution tool
+
+Прогон длинный: ~500 кандидатов на объект × 8 меряемых объектов,
+пачками по 10 при рейт-лимите 20 вызовов/мин — десятки минут
+непрерывной работы. **Сессия execution tool столько не живёт.**
+
+Установлено эмпирически 2026-08-07: три попытки подряд оборвались на
+разном объёме работы (25 → 792 → +110 оценок), без ошибки в логе, без
+OOM (`dmesg`/`journalctl` чисты, cgroup-лимитов нет, свободно 9 из
+11 Gi). Процесс не падал — его убивали вместе с сессией. `nohup`
+защищает от SIGHUP, но не от сноса всей процесс-группы; `wait $PID`
+вдобавок держит сессию открытой до конца прогона, то есть гарантирует
+попадание под таймаут.
+
+Правильный способ — transient systemd-unit: собственный cgroup,
+владелец systemd, живёт независимо от вызывающей сессии.
+
 ```bash
 cd /root/.openclaw/workspace
-. agents/agent_2/.venv/bin/activate
-python agents/agent_2/scripts/run_regression.py \
-  --labels experiments/retrieval_eval/data/labels_v2.jsonl \
-  --out agents/agent_2/data/regression_report.json
-echo "exit code: $?"
+
+systemd-run --unit=agent2-regression --collect \
+  --working-directory=/root/.openclaw/workspace \
+  agents/agent_2/.venv/bin/python \
+    agents/agent_2/scripts/run_regression.py \
+    --labels experiments/retrieval_eval/data/labels_v2.jsonl \
+    --env-file agents/agent_1/.env \
+    --out agents/agent_2/data/regression_report.json
 ```
 
-Условие приёмки (`openspec/changes/rework-agent-2-filter/specs/
-agent_2-filtering/spec.md`): средняя полнота ≥70%. Скрипт возвращает
-exit code 1, если порог не достигнут, — это тоже полезный результат,
-не ошибка запуска.
+Команда возвращает управление сразу — **не ждать её**. Проверять
+отдельными вызовами, в любой момент:
+
+```bash
+systemctl status agent2-regression --no-pager
+journalctl -u agent2-regression --no-pager | tail -40
+```
+
+По завершении: `systemctl status` покажет итоговый exit code,
+`journalctl` — весь вывод (recall по объектам + средний), отчёт
+окажется в `agents/agent_2/data/regression_report.json`.
+
+Альтернативы, если `systemd-run` недоступен: `tmux new -d`/`screen -dm`
+(живая сессия вне execution tool) или запуск с внешнего терминала.
+`nohup … & wait` — не годится, проверено.
+
+### Прогресс не теряется между попытками
+
+Кэш `agent_1_v5.agent_2_llm_scores` хранит все уже полученные оценки
+(ключ: объект + документ + модель). Повторный запуск не пересчитывает
+их и продолжает с места обрыва — деньги на LLM тратятся один раз.
+При необходимости дробить прогон: `--only-objects 2,3,4`.
+
+### Условие приёмки
+
+Средняя полнота ≥70% (`openspec/changes/rework-agent-2-filter/specs/
+agent_2-filtering/spec.md`). Скрипт возвращает exit code 1, если порог
+не достигнут, — это тоже полезный результат, не ошибка запуска.
+
+По умолчанию меряются не все объекты: `--min-positives 5` отбрасывает
+объекты, где положительных слишком мало для осмысленного числа, а
+`--exclude-objects 9` — объект с заведомо испорченной разметкой. Оба
+значения из оригинального замера, менять только осознанно.
 
 Требует `AGENT_1_DB_DSN` и `OPENROUTER_API_KEY` в `agents/agent_2/.env`
 (или `agents/agent_1/.env` — скрипт по умолчанию ищет
 `agents/agent_2/.env`, при отсутствии передать
-`--env-file ../agent_1/.env`) и рабочий `openclaw` CLI в PATH.
+`--env-file agents/agent_1/.env`) и рабочий `openclaw` CLI в PATH.
 
 ## 7. Что прислать обратно (по регрессионному тесту)
 
-Полный stdout прогона (recall по каждому объекту + средний) и exit code.
+Полный вывод `journalctl -u agent2-regression` (recall по каждому
+объекту + средний) и итоговый статус из `systemctl status`.
 Если упадёт на импорте/подключении — текст ошибки целиком, не
 пересказ, не чинить вслепую.
