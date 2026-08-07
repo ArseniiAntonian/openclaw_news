@@ -156,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
           f"{ACCEPTANCE_RECALL_THRESHOLD:.0%})")
 
     if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(
             json.dumps({"mean_recall": mean_recall, "objects": results}, ensure_ascii=False, indent=2),
             encoding="utf-8",
