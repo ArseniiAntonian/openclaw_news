@@ -13,6 +13,20 @@
 `docs/architecture/retrieval_research_report.md` и
 `openspec/changes/rework-agent-2-filter/`.
 
+## Install
+
+```bash
+cd /root/.openclaw/workspace/agents/agent_2
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+```
+
+`python3` явно на шаге создания venv: на проде голый `python` не
+гарантирован. Дальше внутри активированного venv `python` работает
+штатно. Подробнее — `db/MIGRATION.md`, разделы 5–7 (первичная накатка,
+окружение, регрессионный тест).
+
 ## Constraints
 
 - KR, драйверы, «Упоминания» — вне контракта, читает выход другой агент.

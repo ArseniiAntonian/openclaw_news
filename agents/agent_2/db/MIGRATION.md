@@ -74,6 +74,48 @@ psql "$AGENT_1_DB_DSN" -c "\d agent_1_v5.agent_2_relevant_documents"
 Ожидается: 10 строк в `observation_objects` (id 1–10), пустые
 `agent_2_llm_scores`/`agent_2_relevant_documents`.
 
-## 4. Что прислать обратно
+## 4. Что прислать обратно (по накатке)
 
 Вывод команд из шага 3 (или шага 1, если остановились на стоп-условии).
+
+## 5. Окружение для регрессионного теста (один раз)
+
+**На этом хосте бинарник `python` не гарантирован** (встречалось
+`python: command not found` — есть только `python3`). Venv создаём явно
+через `python3`; внутри активированного venv `python` уже работает
+штатно (это симлинк venv, не системный бинарник) — тот же паттерн, что
+в `agents/agent_1/README.md`, раздел «Install».
+
+```bash
+cd /root/.openclaw/workspace/agents/agent_2
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## 6. Прогон регрессионного теста
+
+```bash
+cd /root/.openclaw/workspace
+. agents/agent_2/.venv/bin/activate
+python agents/agent_2/scripts/run_regression.py \
+  --labels experiments/retrieval_eval/data/labels_v2.jsonl \
+  --out agents/agent_2/data/regression_report.json
+echo "exit code: $?"
+```
+
+Условие приёмки (`openspec/changes/rework-agent-2-filter/specs/
+agent_2-filtering/spec.md`): средняя полнота ≥70%. Скрипт возвращает
+exit code 1, если порог не достигнут, — это тоже полезный результат,
+не ошибка запуска.
+
+Требует `AGENT_1_DB_DSN` и `OPENROUTER_API_KEY` в `agents/agent_2/.env`
+(или `agents/agent_1/.env` — скрипт по умолчанию ищет
+`agents/agent_2/.env`, при отсутствии передать
+`--env-file ../agent_1/.env`) и рабочий `openclaw` CLI в PATH.
+
+## 7. Что прислать обратно (по регрессионному тесту)
+
+Полный stdout прогона (recall по каждому объекту + средний) и exit code.
+Если упадёт на импорте/подключении — текст ошибки целиком, не
+пересказ, не чинить вслепую.
