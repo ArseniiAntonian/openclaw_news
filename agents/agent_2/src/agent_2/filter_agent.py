@@ -145,6 +145,12 @@ def filter_object(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # См. run_regression.py: без этого nohup/редирект в файл блочно
+    # буферизует вывод, и при внешнем убийстве процесса лог остаётся
+    # пустым несмотря на реально сделанную работу.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     ap = argparse.ArgumentParser(description="Агент 2: отбор документов под объект наблюдения")
     ap.add_argument("--object", type=int, default=None, help="id_object для одиночного прогона")
     ap.add_argument("--all", action="store_true", help="прогнать все объекты каталога")

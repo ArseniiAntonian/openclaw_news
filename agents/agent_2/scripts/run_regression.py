@@ -71,6 +71,15 @@ def recall(found: set[int], positives: set[int]) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Грабля прода 2026-08-07: nohup ... > file делает stdout/stderr
+    # блочно-буферизованными (не терминал) -- при внешнем убийстве
+    # процесса (OOM-killer, рестарт среды) буфер не успевает сброситься
+    # на диск, и лог остаётся пустым несмотря на реально сделанную
+    # работу (объекты уже частично оценены и лежат в кэше). Строчная
+    # буферизация не зависит от того, вспомнит ли вызывающий `-u`.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     ap = argparse.ArgumentParser(description="Регрессионный тест агента 2 на эталоне")
     ap.add_argument("--labels", type=Path, required=True)
     ap.add_argument("--relation", choices=("event", "any"), default="event")
