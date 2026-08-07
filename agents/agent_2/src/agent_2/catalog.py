@@ -8,6 +8,7 @@ observation_objects_context.md`) -- этот модуль его не порож
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,33 @@ sys.path.insert(0, "/root/.openclaw/workspace/agents/agent_1/src")
 class ContractError(ValueError):
     """Объект каталога нарушает обязательный контракт (например, без
     search_description)."""
+
+
+def _parse_query_embedding(value: Any, id_object: int) -> list[float] | None:
+    """Привести pgvector к списку чисел.
+
+    Без зарегистрированного адаптера psycopg возвращает ``vector`` как
+    текст ``[0.1,...]``. Векторный канал ожидает список чисел для
+    ``embed_v5.vector_literal()``, поэтому строку нельзя передавать дальше
+    как есть.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ContractError(
+                f"объект {id_object}: query_embedding не является JSON-вектором"
+            ) from exc
+    if not isinstance(value, (list, tuple)):
+        raise ContractError(f"объект {id_object}: query_embedding не является списком чисел")
+    try:
+        return [float(item) for item in value]
+    except (TypeError, ValueError) as exc:
+        raise ContractError(
+            f"объект {id_object}: query_embedding содержит нечисловое значение"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -51,7 +79,7 @@ def _row_to_object(row: dict[str, Any]) -> ObservationObject:
         keywords=row.get("keywords"),
         negative_filter=row.get("negative_filter"),
         search_description=description,
-        query_embedding=row.get("query_embedding"),
+        query_embedding=_parse_query_embedding(row.get("query_embedding"), row["id_object"]),
     )
 
 

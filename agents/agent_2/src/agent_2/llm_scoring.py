@@ -47,6 +47,27 @@ RUBRIC_PROMPT_TEMPLATE = """Оцени по шкале 0-10, насколько 
 {{"score": <число от 0 до 10>, "reason": "<одно предложение обоснования>"}}
 """
 
+BATCH_RUBRIC_PROMPT_TEMPLATE = """Оцени по шкале 0-10, насколько каждая новость относится к объекту наблюдения.
+
+## Объект наблюдения
+{label}
+
+Что ищем (поисковое описание объекта): {search_description}
+
+## Новости
+{documents}
+
+## Рубрика
+- 10 — новость целиком об объекте наблюдения по существу.
+- 4-6 — объект упомянут, но новость по существу про что-то другое.
+- 0 — новость не относится к объекту вообще.
+Используй промежуточные значения по своему суждению.
+
+## Формат ответа — строго JSON, без пояснений вне JSON
+Верни оценку ровно для каждой новости, не добавляй и не пропускай id:
+{{"scores": [{{"id_clean_post": <id>, "score": <число от 0 до 10>, "reason": "<одно предложение>"}}]}}
+"""
+
 
 class ScoringError(RuntimeError):
     pass
@@ -114,6 +135,7 @@ class ScoringConfig:
     rate_limit_per_minute: float = 20.0
     max_retries: int = 5
     default_backoff_seconds: float = 30.0
+    batch_size: int = 10
 
 
 def call_openclaw(
@@ -238,6 +260,55 @@ def parse_score_response(raw_output: str) -> tuple[float, str]:
     return score, (reason if isinstance(reason, str) else "")
 
 
+def parse_batch_score_response(raw_output: str, expected_ids: set[int]) -> dict[int, float]:
+    """Распаковать пакетный ответ и строго сверить набор документов.
+
+    Неполный пакет нельзя принимать частично: иначе документ оказался бы
+    пропущенным без оценки, что нарушает D7.
+    """
+    outer = _extract_json_object(raw_output)
+    if "scores" in outer:
+        payload = outer
+    else:
+        reply_text = None
+        result = outer.get("result")
+        if isinstance(result, dict) and isinstance(result.get("meta"), dict):
+            meta = result["meta"]
+            reply_text = meta.get("finalAssistantVisibleText") or meta.get("finalAssistantRawText")
+        if reply_text is None and isinstance(outer.get("meta"), dict):
+            meta = outer["meta"]
+            reply_text = meta.get("finalAssistantVisibleText") or meta.get("finalAssistantRawText")
+        if reply_text is None:
+            raise ScoringError("ответ OpenClaw не содержит пакет оценок")
+        payload = _extract_json_object(reply_text)
+
+    rows = payload.get("scores")
+    if not isinstance(rows, list):
+        raise ScoringError("пакетный ответ не содержит список scores")
+    scores: dict[int, float] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ScoringError("пакетный ответ содержит не-объект")
+        doc_id = row.get("id_clean_post")
+        score = row.get("score")
+        if not isinstance(doc_id, int) or isinstance(doc_id, bool):
+            raise ScoringError("id_clean_post в пакетном ответе должен быть целым числом")
+        if not isinstance(score, (int, float)) or isinstance(score, bool):
+            raise ScoringError(f"score для документа {doc_id} должен быть числом 0-10")
+        score = float(score)
+        if score < 0 or score > 10:
+            raise ScoringError(f"score для документа {doc_id} вне диапазона 0-10: {score}")
+        if doc_id in scores:
+            raise ScoringError(f"документ {doc_id} продублирован в пакетном ответе")
+        scores[doc_id] = score
+    if set(scores) != expected_ids:
+        raise ScoringError(
+            "пакетный ответ вернул другой набор документов: "
+            f"ожидалось {sorted(expected_ids)}, получено {sorted(scores)}"
+        )
+    return scores
+
+
 # --------------------------------------------------------------------------- #
 # Кэш: agent_1_v5.agent_2_llm_scores, ключ (id_object, id_clean_post, model)
 # --------------------------------------------------------------------------- #
@@ -291,41 +362,48 @@ def score_candidates(
 
     limiter = RateLimiter(config.rate_limit_per_minute)
     scores: dict[int, float] = dict(cached)
-    failed: list[tuple[int, str]] = []
-    for candidate in candidates:
-        doc_id = candidate["id_clean_post"]
-        if doc_id in cached:
-            continue
-        prompt = RUBRIC_PROMPT_TEMPLATE.format(
+    uncached = [candidate for candidate in candidates if candidate["id_clean_post"] not in cached]
+    failed_batches: list[tuple[set[int], str]] = []
+    batch_size = max(1, config.batch_size)
+    for offset in range(0, len(uncached), batch_size):
+        batch = uncached[offset : offset + batch_size]
+        documents = "\n\n".join(
+            "### Документ {id}\nЗаголовок: {title}\nТекст: {text}".format(
+                id=candidate["id_clean_post"],
+                title=candidate.get("title") or "",
+                text=candidate.get("text") or "",
+            )
+            for candidate in batch
+        )
+        prompt = BATCH_RUBRIC_PROMPT_TEMPLATE.format(
             label=label,
             search_description=search_description,
-            title=candidate.get("title") or "",
-            text=candidate.get("text") or "",
+            documents=documents,
         )
-        session_key = f"agent:{config.agent_id}:agent2-score-obj-{id_object}-doc-{doc_id}"
+        batch_ids = {candidate["id_clean_post"] for candidate in batch}
+        session_key = f"agent:{config.agent_id}:agent2-score-obj-{id_object}-batch-{offset // batch_size}"
         limiter.wait()
-        # design D7: сбой на одном кандидате MUST NOT прерывать обработку
-        # остальных кандидатов батча -- грабля прода 2026-08-06: без этого
-        # try/except один упавший кандидат ронял весь прогон, объекты
-        # после текущего даже не начинались. И "не пропускать документ без
-        # оценки молча" -- поэтому не тихий continue, а явный WARNING.
         try:
             raw = call_openclaw_with_backoff(prompt, session_key, config=config)
-            score, _reason = parse_score_response(raw)
+            batch_scores = parse_batch_score_response(raw, batch_ids)
         except (ScoringError, AgentCapacityError) as exc:
             print(
-                f"WARNING: object={id_object} doc={doc_id}: оценка не получена "
-                f"({exc}) -- документ пропущен явно, обработка остальных кандидатов продолжается",
+                f"WARNING: object={id_object} batch={offset // batch_size} "
+                f"docs={sorted(batch_ids)}: оценки не получены ({exc}) -- "
+                "пакет пропущен явно, обработка остальных продолжается",
                 file=sys.stderr,
             )
-            failed.append((doc_id, str(exc)))
+            failed_batches.append((batch_ids, str(exc)))
             continue
-        store_score(conn, id_object, doc_id, model_key, score)
-        scores[doc_id] = score
-    if failed:
+        for doc_id, score in batch_scores.items():
+            store_score(conn, id_object, doc_id, model_key, score)
+            scores[doc_id] = score
+    if failed_batches:
+        failed_docs = sum(len(ids) for ids, _ in failed_batches)
         print(
-            f"object={id_object}: {len(failed)} кандидат(ов) без оценки из "
-            f"{len(candidates) - len(cached)} новых (см. WARNING выше)",
+            f"object={id_object}: {failed_docs} кандидат(ов) в "
+            f"{len(failed_batches)} пакет(ах) без оценки из "
+            f"{len(uncached)} новых (см. WARNING выше)",
             file=sys.stderr,
         )
     return scores

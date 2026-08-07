@@ -18,6 +18,7 @@ from agent_2.llm_scoring import (  # noqa: E402
     _is_capacity_error_detail,
     _parse_retry_after_seconds,
     fetch_cached_scores,
+    parse_batch_score_response,
     parse_score_response,
     score_candidates,
     store_score,
@@ -122,6 +123,21 @@ class ScoringResponseTests(unittest.TestCase):
         with self.assertRaises(Exception):
             parse_score_response(raw)
 
+    def test_batch_response_requires_exact_document_set(self) -> None:
+        raw = json.dumps({"scores": [
+            {"id_clean_post": 101, "score": 8},
+            {"id_clean_post": 102, "score": 2.5},
+        ]})
+        self.assertEqual(
+            parse_batch_score_response(raw, {101, 102}),
+            {101: 8.0, 102: 2.5},
+        )
+
+    def test_batch_response_rejects_missing_document(self) -> None:
+        raw = json.dumps({"scores": [{"id_clean_post": 101, "score": 8}]})
+        with self.assertRaises(Exception):
+            parse_batch_score_response(raw, {101, 102})
+
 
 class CapacityErrorDetectionTests(unittest.TestCase):
     def test_detects_429(self) -> None:
@@ -225,7 +241,8 @@ class ScoreCandidatesResilienceTests(unittest.TestCase):
         cursor = _FakeCursor(fetch_rows=[])  # кэш пуст -- все 3 кандидата новые
         conn = _FakeConn(cursor)
         config = ScoringConfig(
-            openclaw_cmd="openclaw", agent_id="agent_2", rate_limit_per_minute=0
+            openclaw_cmd="openclaw", agent_id="agent_2", rate_limit_per_minute=0,
+            batch_size=1,
         )
         candidates = [
             {"id_clean_post": 1, "title": "t1", "text": "x1"},
@@ -234,9 +251,10 @@ class ScoreCandidatesResilienceTests(unittest.TestCase):
         ]
 
         def fake_call(prompt: str, session_key: str, *, config: ScoringConfig) -> str:
-            if "doc-2" in session_key:
+            if "batch-1" in session_key:
                 raise ScoringError("boom: провайдер вернул мусор")
-            return json.dumps({"score": 8.0, "reason": "ok"})
+            doc_id = 1 if "batch-0" in session_key else 3
+            return json.dumps({"scores": [{"id_clean_post": doc_id, "score": 8.0, "reason": "ok"}]})
 
         with patch("agent_2.llm_scoring.call_openclaw_with_backoff", side_effect=fake_call):
             scores = score_candidates(
