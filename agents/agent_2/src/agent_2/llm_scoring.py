@@ -16,6 +16,7 @@ import json
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -290,6 +291,7 @@ def score_candidates(
 
     limiter = RateLimiter(config.rate_limit_per_minute)
     scores: dict[int, float] = dict(cached)
+    failed: list[tuple[int, str]] = []
     for candidate in candidates:
         doc_id = candidate["id_clean_post"]
         if doc_id in cached:
@@ -302,8 +304,28 @@ def score_candidates(
         )
         session_key = f"agent:{config.agent_id}:agent2-score-obj-{id_object}-doc-{doc_id}"
         limiter.wait()
-        raw = call_openclaw_with_backoff(prompt, session_key, config=config)
-        score, _reason = parse_score_response(raw)
+        # design D7: сбой на одном кандидате MUST NOT прерывать обработку
+        # остальных кандидатов батча -- грабля прода 2026-08-06: без этого
+        # try/except один упавший кандидат ронял весь прогон, объекты
+        # после текущего даже не начинались. И "не пропускать документ без
+        # оценки молча" -- поэтому не тихий continue, а явный WARNING.
+        try:
+            raw = call_openclaw_with_backoff(prompt, session_key, config=config)
+            score, _reason = parse_score_response(raw)
+        except (ScoringError, AgentCapacityError) as exc:
+            print(
+                f"WARNING: object={id_object} doc={doc_id}: оценка не получена "
+                f"({exc}) -- документ пропущен явно, обработка остальных кандидатов продолжается",
+                file=sys.stderr,
+            )
+            failed.append((doc_id, str(exc)))
+            continue
         store_score(conn, id_object, doc_id, model_key, score)
         scores[doc_id] = score
+    if failed:
+        print(
+            f"object={id_object}: {len(failed)} кандидат(ов) без оценки из "
+            f"{len(candidates) - len(cached)} новых (см. WARNING выше)",
+            file=sys.stderr,
+        )
     return scores

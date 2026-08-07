@@ -112,17 +112,32 @@ def main(argv: list[str] | None = None) -> int:
         set_ef_search(conn, max(args.candidates * 2, 100))
 
         for object_id, positives in sorted(truth.items()):
-            obj = catalog.fetch_object(conn, object_id)
+            # Сбой на одном объекте MUST NOT останавливать обработку
+            # остальных -- грабля прода 2026-08-06: без этого защитного
+            # блока падение на объекте 1 обрывало весь прогон, объекты
+            # 2-10 не запускались вовсе, и это никак не отражалось в
+            # выводе. rollback() на случай, если исключение оставило
+            # соединение в aborted-транзакции (store_score коммитит
+            # после каждой оценки, так что потеря данных минимальна).
+            try:
+                obj = catalog.fetch_object(conn, object_id)
 
-            # dry_run=True: регрессионный тест не должен писать в
-            # agent_2_relevant_documents -- только измеряет.
-            report = filter_object(
-                conn, obj,
-                candidates_depth=args.candidates,
-                scoring_config=scoring_config,
-                api_key=api_key,
-                dry_run=True,
-            )
+                # dry_run=True: регрессионный тест не должен писать в
+                # agent_2_relevant_documents -- только измеряет.
+                report = filter_object(
+                    conn, obj,
+                    candidates_depth=args.candidates,
+                    scoring_config=scoring_config,
+                    api_key=api_key,
+                    dry_run=True,
+                )
+            except Exception as exc:
+                conn.rollback()
+                print(f"ERROR: объект {object_id} упал: {exc} -- "
+                      f"пропущен явно, остальные объекты продолжаются", file=sys.stderr)
+                results[str(object_id)] = {"error": str(exc)}
+                continue
+
             selected_ids: set[int] = report["selected_ids"]
 
             value = recall(selected_ids, positives)

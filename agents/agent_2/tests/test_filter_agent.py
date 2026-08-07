@@ -5,6 +5,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -12,10 +13,13 @@ from agent_2.catalog import ContractError, _row_to_object  # noqa: E402
 from agent_2.channels import union_candidates  # noqa: E402
 from agent_2.db import to_postgres  # noqa: E402
 from agent_2.llm_scoring import (  # noqa: E402
+    ScoringConfig,
+    ScoringError,
     _is_capacity_error_detail,
     _parse_retry_after_seconds,
     fetch_cached_scores,
     parse_score_response,
+    score_candidates,
     store_score,
 )
 
@@ -210,6 +214,67 @@ class CacheModelIsolationTests(unittest.TestCase):
         self.assertIn("ON CONFLICT (id_object, id_clean_post, model)", sql)
         self.assertIn("opus", params)
         self.assertTrue(conn.committed)
+
+
+class ScoreCandidatesResilienceTests(unittest.TestCase):
+    """design D7 + грабля прода 2026-08-06: сбой на одном кандидате
+    ронял ВЕСЬ прогон (включая объекты, которые ещё не начинались) --
+    не было try/except вокруг вызова оценки."""
+
+    def test_one_failing_candidate_does_not_abort_the_rest(self) -> None:
+        cursor = _FakeCursor(fetch_rows=[])  # кэш пуст -- все 3 кандидата новые
+        conn = _FakeConn(cursor)
+        config = ScoringConfig(
+            openclaw_cmd="openclaw", agent_id="agent_2", rate_limit_per_minute=0
+        )
+        candidates = [
+            {"id_clean_post": 1, "title": "t1", "text": "x1"},
+            {"id_clean_post": 2, "title": "t2", "text": "x2"},
+            {"id_clean_post": 3, "title": "t3", "text": "x3"},
+        ]
+
+        def fake_call(prompt: str, session_key: str, *, config: ScoringConfig) -> str:
+            if "doc-2" in session_key:
+                raise ScoringError("boom: провайдер вернул мусор")
+            return json.dumps({"score": 8.0, "reason": "ok"})
+
+        with patch("agent_2.llm_scoring.call_openclaw_with_backoff", side_effect=fake_call):
+            scores = score_candidates(
+                conn,
+                id_object=1,
+                label="GigaChat",
+                search_description="Новости о GigaChat.",
+                candidates=candidates,
+                config=config,
+            )
+
+        # doc 1 и 3 оценены несмотря на падение doc 2 -- сбой одного
+        # кандидата НЕ прервал обработку остальных (D7).
+        self.assertEqual(set(scores), {1, 3})
+        self.assertNotIn(2, scores)  # ...и не пропущен молча (assert ниже это подтверждает)
+
+    def test_all_candidates_failing_does_not_raise(self) -> None:
+        cursor = _FakeCursor(fetch_rows=[])
+        conn = _FakeConn(cursor)
+        config = ScoringConfig(
+            openclaw_cmd="openclaw", agent_id="agent_2", rate_limit_per_minute=0
+        )
+        candidates = [{"id_clean_post": 1, "title": "t1", "text": "x1"}]
+
+        with patch(
+            "agent_2.llm_scoring.call_openclaw_with_backoff",
+            side_effect=ScoringError("провайдер недоступен"),
+        ):
+            scores = score_candidates(
+                conn,
+                id_object=1,
+                label="GigaChat",
+                search_description="Новости о GigaChat.",
+                candidates=candidates,
+                config=config,
+            )
+
+        self.assertEqual(scores, {})  # ни одного исключения наружу, пустой результат
 
 
 if __name__ == "__main__":
