@@ -43,14 +43,30 @@ from agent_2.llm_scoring import ScoringConfig, resolve_default_openclaw_cmd  # n
 ACCEPTANCE_RECALL_THRESHOLD = 0.70  # specs/agent_2-filtering/spec.md
 DEFAULT_ENV = Path(__file__).resolve().parents[1] / ".env"
 
+# Из оригинального замера (experiments/retrieval_eval/run_eval.py):
+# объекты с меньшим числом положительных -- шум, не измерение.
+DEFAULT_MIN_POSITIVES = 5
+# Объект 9 ("Лидеры мнений") в эталоне испорчен: после уточнения
+# формулировки собрал 293 метки "только модель" против 2 совпадений с
+# каталогом, то есть стал означать "любая новость, где кто-то
+# высказался об ИИ". Исключался и в оригинальном замере.
+DEFAULT_EXCLUDE_OBJECTS = (9,)
+
 
 def load_truth(
-    path: Path, relation: str = "event"
+    path: Path, min_positives: int = DEFAULT_MIN_POSITIVES, relation: str = "event"
 ) -> dict[int, set[int]]:
     """object_id -> положительные id_clean_post.
 
     Перенесено из experiments/retrieval_eval/run_eval.py:load_truth без
     изменения логики (relation="event"|"any").
+
+    `min_positives` -- объекты с меньшим числом положительных не меряем:
+    это шум, а не измерение. Формулировка и значение по умолчанию (5) --
+    из оригинального замера. Грабля 2026-08-07: в первой версии этого
+    скрипта фильтр был потерян при переносе, и объект 1 дал "recall
+    75.0%" на четырёх положительных (3 документа из 4) -- число, которое
+    один документ двигает на 25 пунктов.
     """
     truth: dict[int, set[int]] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -63,7 +79,7 @@ def load_truth(
             ids += list(row.get("mention_objects") or [])
         for object_id in ids:
             truth.setdefault(int(object_id), set()).add(doc_id)
-    return truth
+    return {k: v for k, v in truth.items() if len(v) >= min_positives}
 
 
 def recall(found: set[int], positives: set[int]) -> float:
@@ -83,6 +99,17 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Регрессионный тест агента 2 на эталоне")
     ap.add_argument("--labels", type=Path, required=True)
     ap.add_argument("--relation", choices=("event", "any"), default="event")
+    ap.add_argument(
+        "--min-positives", type=int, default=DEFAULT_MIN_POSITIVES,
+        help=f"объекты с меньшим числом положительных не мерим -- шум "
+             f"(по умолчанию {DEFAULT_MIN_POSITIVES}, как в оригинальном замере)",
+    )
+    ap.add_argument(
+        "--exclude-objects", type=int, nargs="*", default=list(DEFAULT_EXCLUDE_OBJECTS),
+        help="не мерить эти объекты (разметка заведомо испорчена). "
+             f"По умолчанию {list(DEFAULT_EXCLUDE_OBJECTS)} -- см. комментарий у "
+             "DEFAULT_EXCLUDE_OBJECTS. Передать пустой список, чтобы мерить все.",
+    )
     ap.add_argument("--candidates", type=int, default=500)
     ap.add_argument("--openclaw-cmd", default=os.getenv("AGENT_2_OPENCLAW_CMD", resolve_default_openclaw_cmd()))
     ap.add_argument("--agent-id", default=os.getenv("AGENT_2_SCORING_AGENT_ID", DEFAULT_AGENT_ID))
@@ -111,7 +138,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {args.dsn_var} не найден (нет .env в этом окружении?)", file=sys.stderr)
         return 1
 
-    truth = load_truth(args.labels, args.relation)
+    truth = load_truth(args.labels, args.min_positives, args.relation)
+    for object_id in args.exclude_objects:
+        if truth.pop(object_id, None) is not None:
+            print(f"объект {object_id} исключён из замера (--exclude-objects)",
+                  file=sys.stderr)
     if args.only_objects:
         wanted = {int(x) for x in args.only_objects.split(",") if x.strip()}
         truth = {oid: positives for oid, positives in truth.items() if oid in wanted}
